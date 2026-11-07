@@ -156,10 +156,10 @@ class BuilderPanel(QWidget):
         self.trim_off = _spin(self._saved("trim_offset"), -20, 30, 0.5)
         self.trim_off.setToolTip(tr("builder_trim_tip"))
         form.addRow(tr("builder_trim_level"), self.trim_off)
-        self.trim.toggled.connect(lambda on: (self.trim_off.setEnabled(on), self._schedule_preview()))
+        self.trim.toggled.connect(lambda on: (self.trim_off.setEnabled(on), self._changed()))
         self.trim_off.setEnabled(self.trim.isChecked())
-        self.trim_off.valueChanged.connect(lambda _v: self._schedule_preview())
-        self.auto.toggled.connect(lambda _on: self._schedule_preview())
+        self.trim_off.valueChanged.connect(lambda _v: self._changed())
+        self.auto.toggled.connect(lambda _on: self._changed())
         self.base = _spin(self._saved("base"), 0.5, 40, 0.5)
         form.addRow(tr("builder_base"), self.base)
         self.edge = _spin(self._saved("edge"), 0.0, 10, 0.5)
@@ -229,9 +229,18 @@ class BuilderPanel(QWidget):
         elif self.preview is not None:
             self.preview.hide()
 
-    def _schedule_preview(self):
-        if self.active:
+    def _schedule_preview(self, force=False):
+        if self.active and (force or not getattr(self, "_just_built", False)):
             self._preview_timer.start(250)
+
+    def _changed(self):
+        self._just_built = False
+        self._schedule_preview(force=True)
+
+    def selection_changed(self):
+        """The user picked other models: show the trim preview again."""
+        self._just_built = False
+        self.refresh()
 
     def update_preview(self):
         if self.preview is None or not self.active:
@@ -338,7 +347,7 @@ class BuilderPanel(QWidget):
                 prefix = f"{m.name}: " if len(models) > 1 else ""
                 results = build_models(scan, self.options(), lambda t, p=prefix: progress(p + t))
                 for i, r in enumerate(results):
-                    self.add_result(m, r, i + 1 if len(results) > 1 else None)
+                    self.add_result(m, r, i + 1 if len(results) > 1 else None, made == 0)
                     made += 1
                     faces += r.n_faces
         except BuildError as exc:
@@ -364,6 +373,7 @@ class BuilderPanel(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
             self.go.setEnabled(True)
+        self._just_built = made > 0
         if made:
             text = tr("builder_done", n=made, faces=faces)
             if warnings:

@@ -93,7 +93,7 @@ class MainWindow(QMainWindow):
         self.orient_panel = OrientPanel(self.orient)
         self.stack.addWidget(self.orient_panel)
         self.builder_panel = BuilderPanel(lambda: self._selected_models(),
-                                          lambda src, mesh, part: self._add_built(src, mesh, part),
+                                          lambda src, mesh, part, first: self._add_built(src, mesh, part, first),
                                           lambda text: self.statusBar().showMessage(text),
                                           self.push_undo, lambda: self._tools_changed(),
                                           viewer=self.viewer, settings=self.settings)
@@ -348,7 +348,7 @@ class MainWindow(QMainWindow):
         if self.orient.active and m is not self.orient.model:
             self.orient.set_model(m)
         if self.a_builder.isChecked():
-            self.builder_panel.refresh()
+            self.builder_panel.selection_changed()
         for other in self.viewer.models:
             if other is not m and other.selection.any():
                 other.clear_selection()
@@ -562,15 +562,22 @@ class MainWindow(QMainWindow):
             return []
         rows = self.panel.selected_rows()
         models = [self.viewer.models[r] for r in rows if r < len(self.viewer.models)]
+        visible = [m for m in models if m.visible]
+        if visible:  # hidden models in the selection (e.g. the scan behind a built model) are left out
+            models = visible
         if not models:
             m = self.active_model()
             models = [m] if m is not None else []
         return models
 
-    def _add_built(self, source, mesh, part=None):
+    def _add_built(self, source, mesh, part=None, first=True):
         source.set_visible(False)
         suffix = f" - model {part}" if part else " - model"
         self._add_model(Model(f"{source.name}{suffix}", mesh, material="Stone - Yellow"))
+        # select just the new model(s): pressing Create again must not rebuild from the results
+        if first:
+            self.model_list.clearSelection()
+        self.model_list.item(self.model_list.count() - 1).setSelected(True)
         self.panel.refresh_rows()
         self._models_changed()
 
