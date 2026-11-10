@@ -32,7 +32,7 @@ class CutTool:
         self.on_change = on_change
         self.mode = BRUSH
         self.radius = 25.0
-        self.through = False
+        self.through = True  # cut through the model by default
         self.active = False
 
         ren = viewer.ren
@@ -399,6 +399,7 @@ class CutPanel(QWidget):
         lay.addWidget(clear_btn)
 
         self.through = QCheckBox(tr("through"))
+        self.through.setChecked(tool.through)
         self.through.toggled.connect(lambda on: setattr(self.tool, "through", on))
         lay.addWidget(self.through)
 

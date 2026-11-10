@@ -328,3 +328,40 @@ class ModelsPanel(QFrame):
     def mouseReleaseEvent(self, ev):
         self._drag = None
         super().mouseReleaseEvent(ev)
+
+
+class ViewBar(QFrame):
+    """Floating column of round view buttons under the navigation cube (top-right of the 3D view)."""
+
+    def __init__(self, window, viewer, actions):
+        super().__init__(window, Qt.Tool | Qt.FramelessWindowHint)
+        self.viewer = viewer
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("""
+            QToolButton { background:#22252b; border:2px solid #3a3f48; border-radius:21px; }
+            QToolButton:hover { border-color:#4aa3ff; background:#2c313a; }
+            QToolButton:checked { background:#1d3a5e; border-color:#4aa3ff; }
+            QToolButton:pressed { background:#173050; }
+        """)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(8)
+        for a in actions:
+            b = QToolButton()
+            b.setDefaultAction(a)
+            b.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            b.setIconSize(QSize(24, 24))
+            b.setFixedSize(42, 42)
+            lay.addWidget(b)
+        self.adjustSize()
+
+    def follow(self):
+        if not self.viewer.isVisible():
+            return
+        from .view_cube import ViewCube
+
+        origin = self.viewer.mapToGlobal(QPoint(0, 0))
+        cube_center = self.viewer.width() - ViewCube.MARGIN - ViewCube.SIZE // 2
+        x = max(0, cube_center - self.width() // 2)
+        y = ViewCube.MARGIN + ViewCube.SIZE + 10
+        self.move(origin + QPoint(x, y))

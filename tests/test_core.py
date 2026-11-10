@@ -286,3 +286,33 @@ def test_fill_holes_smooth_and_closed():
     from scipy.spatial import cKDTree
     d, _ = cKDTree(m.vertices).query(fixed.vertices[holed.n_vertices:])
     assert d.max() < 0.8
+
+
+def test_undercut_depth_on_mushroom():
+    """A cap wider than its stem: the stem and the cap's underside are undercut by the overhang."""
+    from proview.survey import undercut_depth
+
+    def ring(r, z, n=96):
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        return np.stack([r * np.cos(t), r * np.sin(t), np.full(n, z)], 1)
+
+    n = 96
+    profile = [(3.0, 0.0), (3.0, 4.0), (5.0, 4.0), (5.0, 6.0), (0.01, 6.0)]  # stem r=3, cap r=5
+    v = np.vstack([ring(r, z, n) for r, z in profile])
+    f = []
+    for k in range(len(profile) - 1):
+        for i in range(n):
+            a, b = k * n + i, k * n + (i + 1) % n
+            f += [(a, b, a + n), (b, b + n, a + n)]
+    f = np.array(f)
+    depth = undercut_depth(v, f, [0, 0, 1], cell=0.1)
+    cen = v[f].mean(1)
+    rad = np.linalg.norm(cen[:, :2], axis=1)
+    stem = (cen[:, 2] < 3.9) & (rad < 3.2)
+    top = cen[:, 2] > 5.9
+    side = (rad > 4.9) & (cen[:, 2] > 4.1) & (cen[:, 2] < 5.9)
+    assert (depth[top] == 0).all()                      # visible from above
+    assert np.median(depth[side]) < 0.3                 # the cap's rim is the height of contour
+    assert abs(np.median(depth[stem]) - 2.0) < 0.3      # overhang is 5 - 3 = 2 mm
+    # from the side everything on the far side / under the cap changes, top is now undercut partly
+    assert (undercut_depth(v, f, [0, 0, -1], cell=0.1)[top] > 0).all()

@@ -89,6 +89,7 @@ class Model:
     # ---------------------------------------------------------------- mesh
     def set_mesh(self, mesh: Mesh) -> None:
         self.mesh = mesh
+        self._overlay = None
         self.polydata = to_polydata(mesh)
         self._normals = self.polydata.GetPointData().GetNormals()
         if getattr(self, "flat", False):
@@ -122,10 +123,27 @@ class Model:
     def select_color(self) -> np.ndarray:
         return SELECT_COLOR_ON_SCAN if self.has_colors and self.show_colors else SELECT_COLOR
 
+    def set_overlay(self, face_rgb) -> None:
+        """Per-face colours shown instead of the material (e.g. undercut map); None removes them."""
+        cd = self.polydata.GetCellData()
+        if cd.HasArray("OverlayColors"):
+            cd.RemoveArray("OverlayColors")
+        self._overlay = None
+        if face_rgb is not None and len(face_rgb) == self.mesh.n_faces:
+            self._overlay = numpy_to_vtk(np.ascontiguousarray(face_rgb, dtype=np.uint8), deep=True)
+            self._overlay.SetName("OverlayColors")
+            cd.AddArray(self._overlay)
+        self.polydata.Modified()
+        self._update_scalars()
+
     def _update_scalars(self) -> None:
         if self.selection.any():
             self.mapper.SetScalarModeToUseCellFieldData()
             self.mapper.SelectColorArray("SelectionColors")
+            self.mapper.ScalarVisibilityOn()
+        elif getattr(self, "_overlay", None) is not None:
+            self.mapper.SetScalarModeToUseCellFieldData()
+            self.mapper.SelectColorArray("OverlayColors")
             self.mapper.ScalarVisibilityOn()
         elif self.has_colors and self.show_colors:
             self.mapper.SetScalarModeToUsePointFieldData()

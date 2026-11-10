@@ -112,6 +112,24 @@ _STRINGS = {
     "repair_done": ("{n} hole(s) filled.", "تم سد {n} ثقب."),
     "builder_memory": ("Not enough memory for this quality - choose Normal or Fast.",
                        "الذاكرة غير كافية - اختر جودة أقل."),
+    "tool_survey": ("Path of insertion / undercuts", "مسار الإدخال"),
+    "tile_survey": ("Undercut", "أندركت"),
+    "survey_title": ("Path of insertion", "مسار الإدخال"),
+    "survey_help": ("Shows the undercuts for a path of insertion. Turn the model until you look along the "
+                    "path you want, then press the button. The arrow shows the insertion direction; coloured "
+                    "areas are undercuts, by depth (horizontal distance, like an undercut gauge).",
+                    "يعرض الأندركت لمسار الإدخال."),
+    "survey_from_view": ("Set path from current view", "تحديد المسار من زاوية النظر"),
+    "survey_from_view_tip": ("The path of insertion becomes the direction you are looking in",
+                             "مسار الإدخال = اتجاه النظر الحالي"),
+    "survey_auto": ("Auto (occlusal)", "تلقائي"),
+    "survey_auto_tip": ("Perpendicular to the occlusal plane", "عمودي على المستوى الإطباقي"),
+    "survey_look": ("Look along path", "النظر مع المسار"),
+    "survey_tilt": ("Tilt", "إمالة"),
+    "survey_arrow": ("Show insertion arrow", "إظهار سهم الإدخال"),
+    "survey_legend": ("Undercut depth:", "عمق الأندركت:"),
+    "survey_stats": ("Deepest undercut: {depth:.2f} mm", "أعمق أندركت: {depth:.2f} مم"),
+    "survey_none": ("No undercuts for this path.", "لا يوجد أندركت لهذا المسار."),
     "tile_cut": ("Cut", "قطع"),
     "tile_align": ("Align", "محاذاة"),
     "tile_merge": ("Merge", "دمج"),
@@ -209,7 +227,7 @@ _STRINGS = {
     "models_tip": ("Ctrl/Shift + click to select several models (for Merge).", "Ctrl + نقر لتحديد عدة نماذج."),
     "drop_hint": ("Open or drag & drop STL / PLY files here", "افتح ملفات STL أو اسحبها وأفلتها هنا"),
     "shortcut_text": (
-        "Shift + middle click  Model see-through on/off\nCtrl + middle click  Hide model\nCtrl+O  Open\nCtrl+S  Save model\nCtrl+Z  Undo\nX  Cut tool\nA  Alignment tool\nS  Section view (measure gaps)\nO  Orientation\nH  Flat (sharp) shading\nM  Merge models\nE  Show edges\nC  Scan colors\n"
+        "Shift + middle click  Model see-through on/off\nCtrl + middle click  Hide model\nCtrl+O  Open\nCtrl+S  Save model\nCtrl+Z  Undo\nX  Cut tool\nA  Alignment tool\nS  Section view (measure gaps)\nO  Orientation\nU  Path of insertion / undercuts\nH  Flat (sharp) shading\nM  Merge models\nE  Show edges\nC  Scan colors\n"
         "1-6  Front / Back / Left / Right / Top / Bottom,  0  Isometric\nClick a face of the view cube to look at it\n"
         "B / L / P  Brush / Lasso / Points\nDel  Delete selection\nEsc  Cancel / clear selection\n"
         "Enter  Close points polyline\nBackspace  Remove last point\n[ ]  Brush size\nF  Fit all",

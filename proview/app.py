@@ -28,10 +28,11 @@ from .i18n import set_language, tr
 from .icons import app_icon, icon
 from .mesh import MESH_EXTENSIONS, load_mesh, merge_meshes, save_mesh
 from .model import MATERIALS, Model
-from .models_panel import ModelsPanel
+from .models_panel import ModelsPanel, ViewBar
 from .builder_tool import BuilderPanel
 from .orient_tool import OrientController, OrientPanel
 from .section_tool import SectionController, SectionPanel
+from .survey_tool import SurveyController, SurveyPanel
 from .viewer import Viewer
 
 UNDO_LIMIT = 30
@@ -65,6 +66,8 @@ class MainWindow(QMainWindow):
         self.cut = CutTool(self.viewer, self.active_model, self.push_undo, self._tools_changed,
                            push_selection_undo=lambda m: self.push_selection_undo(m))
         self.section = SectionController(self.viewer, lambda: self._section_changed())
+        self.survey = SurveyController(self.viewer, lambda: self._selected_models(),
+                                       lambda: self._survey_changed())
         self.orient = OrientController(self.viewer, self.active_model, self.push_undo,
                                        lambda: self._orient_changed())
         self.align = AlignController(self.viewer, self.push_undo, self._tools_changed, self.statusBar().showMessage)
@@ -92,6 +95,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.section_panel)
         self.orient_panel = OrientPanel(self.orient)
         self.stack.addWidget(self.orient_panel)
+        self.survey_panel = SurveyPanel(self.survey)
+        self.stack.addWidget(self.survey_panel)
         self.builder_panel = BuilderPanel(lambda: self._selected_models(),
                                           lambda src, mesh, part, first: self._add_built(src, mesh, part, first),
                                           lambda text: self.statusBar().showMessage(text),
@@ -161,6 +166,7 @@ class MainWindow(QMainWindow):
         a_merge = self._act(tr("merge"), self.merge_models, "M", icon_name="merge")
         self.a_orient = self._act(tr("tool_orient"), self._toggle_orient, "O", checkable=True, icon_name="orient")
         self.a_builder = self._act(tr("tool_builder"), self._toggle_builder, checkable=True, icon_name="builder")
+        self.a_survey = self._act(tr("tool_survey"), self._toggle_survey, "U", checkable=True, icon_name="survey")
         self.a_section = self._act(tr("tool_section"), self._toggle_section, "S", checkable=True,
                                    icon_name="section")
         grp = QActionGroup(self)
@@ -170,8 +176,9 @@ class MainWindow(QMainWindow):
         grp.addAction(self.a_section)
         grp.addAction(self.a_orient)
         grp.addAction(self.a_builder)
+        grp.addAction(self.a_survey)
         mt = mb.addMenu(tr("menu_tools"))
-        for a in (self.a_cut, self.a_align, self.a_section, self.a_orient, self.a_builder, a_merge):
+        for a in (self.a_cut, self.a_align, self.a_section, self.a_orient, self.a_builder, self.a_survey, a_merge):
             mt.addAction(a)
 
         a_help = self._act(tr("shortcuts"), lambda: QMessageBox.information(self, tr("shortcuts"), tr("shortcut_text")),
@@ -195,9 +202,11 @@ class MainWindow(QMainWindow):
         tiles = [
             (self.a_cut, tr("tile_cut")), (self.a_align, tr("tile_align")),
             (self.a_section, tr("tile_section")), (self.a_orient, tr("tile_orient")),
-            (self.a_builder, tr("tile_builder")), (a_merge, tr("tile_merge")),
-            (self.a_colors, tr("tile_colors")), (self.a_flat, tr("tile_flat")), (self.a_edges, tr("tile_edges")), (a_fit, tr("tile_fit")),
+            (self.a_builder, tr("tile_builder")), (self.a_survey, tr("tile_survey")),
+            (a_merge, tr("tile_merge")),
         ]
+        # view switches float under the navigation cube
+        self.view_bar = ViewBar(self, self.viewer, [self.a_colors, self.a_flat, self.a_edges, a_fit])
         for a, label in tiles:
             btn = QToolButton()
             btn.setDefaultAction(a)
@@ -247,20 +256,21 @@ class MainWindow(QMainWindow):
     # ============================================== floating panel tracking
     # These events can arrive while __init__ is still running (Windows sends a move
     # event when the 3D view's native window is created), before the panel exists.
+    def _floating(self):
+        return [w for w in (getattr(self, "panel", None), getattr(self, "view_bar", None)) if w is not None]
+
     def _follow_panel(self):
-        panel = getattr(self, "panel", None)
-        if panel is not None:
-            panel.follow()
+        for w in self._floating():
+            w.follow()
 
     def showEvent(self, ev):
         super().showEvent(ev)
         QTimer.singleShot(0, self._show_panel)
 
     def _show_panel(self):
-        panel = getattr(self, "panel", None)
-        if panel is not None:
-            panel.show()
-            panel.follow()
+        for w in self._floating():
+            w.show()
+            w.follow()
 
     def moveEvent(self, ev):
         super().moveEvent(ev)
@@ -273,9 +283,9 @@ class MainWindow(QMainWindow):
     def changeEvent(self, ev):
         super().changeEvent(ev)
         if ev.type() == QEvent.WindowStateChange:
-            panel = getattr(self, "panel", None)
-            if panel is not None and self.isMinimized():
-                panel.hide()
+            if self.isMinimized():
+                for w in self._floating():
+                    w.hide()
             else:
                 QTimer.singleShot(0, self._show_panel)
 
@@ -349,6 +359,8 @@ class MainWindow(QMainWindow):
             self.orient.set_model(m)
         if self.a_builder.isChecked():
             self.builder_panel.selection_changed()
+        if self.survey.active:
+            self.survey.update()
         for other in self.viewer.models:
             if other is not m and other.selection.any():
                 other.clear_selection()
@@ -526,6 +538,22 @@ class MainWindow(QMainWindow):
             if not self._any_panel_tool():
                 self.tools_dock.hide()
 
+    def _toggle_survey(self, on):
+        if on:
+            self.align.stop_picking()
+            self.stack.setCurrentWidget(self.survey_panel)
+            self.tools_dock.setWindowTitle(tr("survey_title"))
+            self.tools_dock.show()
+            self.survey.activate()
+        else:
+            self.survey.deactivate()
+            if not self._any_panel_tool():
+                self.tools_dock.hide()
+
+    def _survey_changed(self):
+        if hasattr(self, "survey_panel"):
+            self.survey_panel.refresh()
+
     def _toggle_orient(self, on):
         if on:
             self.align.stop_picking()
@@ -541,7 +569,7 @@ class MainWindow(QMainWindow):
 
     def _any_panel_tool(self):
         return any(a.isChecked() for a in (self.a_cut, self.a_align, self.a_section, self.a_orient,
-                                           self.a_builder))
+                                           self.a_builder, self.a_survey))
 
     def _toggle_builder(self, on):
         if on:
@@ -598,6 +626,12 @@ class MainWindow(QMainWindow):
         if self.orient.active:
             self.orient.rebuild()
             self.orient_panel.refresh()
+        if self.survey.active and not getattr(self, "_in_survey", False):
+            self._in_survey = True
+            try:
+                self.survey.update()
+            finally:
+                self._in_survey = False
         self._update_info()
 
     def _cut_mode(self, mode):
@@ -644,6 +678,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         self.panel.close()
+        self.view_bar.close()
         self.viewer.Finalize()
         super().closeEvent(ev)
 

@@ -147,6 +147,12 @@ def run_selftest(win, app, out_png: str) -> None:
         fill_holes(holed, 5.0)
         assert built.n_faces > 0
         log("selftest: model builder ok")
+        win.a_survey.setChecked(True)
+        win.survey.set_from_view()
+        win.survey.tilt("x", 5)
+        assert win.survey.stats is not None
+        win.a_survey.setChecked(False)
+        log("selftest: survey ok")
         win.model_list.selectAll()
         win.merge_models()
         log("selftest: merge ok")
