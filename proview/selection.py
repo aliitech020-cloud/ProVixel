@@ -172,4 +172,4 @@ def pick_mesh(renderer, x, y, world_vertices: np.ndarray, faces: np.ndarray):
     if not hit.any():
         return None
     k = np.argmin(np.where(hit, t, np.inf))
-    return float(t[k]), o + d * t[k]
+    return float(t[k]), o + d * t[k], int(cand[k])

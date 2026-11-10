@@ -110,7 +110,13 @@ class ViewerStyle(vtkInteractorStyleTrackballCamera):
 
     def _wheel(self, direction):
         iren = self.GetInteractor()
-        if self.tool is not None and iren.GetControlKey() and self.tool.on_wheel(direction):
+        ctrl, shift = bool(iren.GetControlKey()), bool(iren.GetShiftKey())
+        if self.tool is None:
+            return False
+        mod = getattr(self.tool, "on_wheel_mod", None)
+        if mod is not None and (ctrl or shift) and mod(direction, ctrl, shift):
+            return True
+        if ctrl and self.tool.on_wheel(direction):
             return True
         return False
 
@@ -244,6 +250,21 @@ class Viewer(QVTKRenderWindowInteractor):
         if not os.environ.get("PROVIEW_MSAA"):
             ren.UseFXAAOn()
         return ren
+
+    def wheelEvent(self, ev):
+        """Pass the wheel with its modifiers (Shift can turn it into a horizontal wheel)."""
+        from PySide6.QtCore import Qt
+
+        d = ev.angleDelta()
+        delta = d.y() or d.x()
+        mods = ev.modifiers()
+        self._Iren.SetControlKey(1 if mods & Qt.ControlModifier else 0)
+        self._Iren.SetShiftKey(1 if mods & Qt.ShiftModifier else 0)
+        if delta > 0:
+            self._Iren.MouseWheelForwardEvent()
+        elif delta < 0:
+            self._Iren.MouseWheelBackwardEvent()
+        ev.accept()
 
     # --------------------------------------------------------------- scene
     def add_model(self, model, fit=False):

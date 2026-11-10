@@ -120,24 +120,6 @@ class BuilderPanel(QWidget):
         self.model_lbl.setStyleSheet("font-weight:bold;")
         lay.addWidget(self.model_lbl)
 
-        # ---------------- repair
-        rep = QGroupBox(tr("repair_title"))
-        rl = QVBoxLayout(rep)
-        row = QHBoxLayout()
-        row.addWidget(QLabel(tr("repair_max")))
-        self.hole_max = _spin(self._saved("hole_max"), 0.5, 200, 1.0)
-        row.addWidget(self.hole_max)
-        rl.addLayout(row)
-        self.holes_lbl = QLabel("")
-        self.holes_lbl.setStyleSheet("color:#aab0bb; font-size:11px;")
-        self.holes_lbl.setWordWrap(True)
-        rl.addWidget(self.holes_lbl)
-        b = QPushButton(tr("repair_go"))
-        b.clicked.connect(lambda _=False: self.fill())
-        rl.addWidget(b)
-        self.hole_max.valueChanged.connect(lambda _v: self.refresh())
-        lay.addWidget(rep)
-
         # ---------------- builder
         box = QGroupBox(tr("builder_title"))
         bl = QVBoxLayout(box)
@@ -213,7 +195,7 @@ class BuilderPanel(QWidget):
     def _save(self):
         if self.settings is None:
             return
-        values = dict(hole_max=self.hole_max.value(), auto=self.auto.isChecked(), trim=self.trim.isChecked(),
+        values = dict(auto=self.auto.isChecked(), trim=self.trim.isChecked(),
                       trim_offset=self.trim_off.value(), base=self.base.value(), edge=self.edge.value(),
                       hollow=self.hollow.isChecked(), wall=self.wall.value(), inner=self.inner.value(),
                       honey=self.honey.isChecked(), cell=self.cell.value(), rib=self.rib.value(),
@@ -264,25 +246,8 @@ class BuilderPanel(QWidget):
 
     def refresh(self):
         models = self.get_models()
-        if not models:
-            self.model_lbl.setText(tr("select_model_first"))
-            self.holes_lbl.setText("")
-        else:
-            names = ", ".join(m.name for m in models)
-            self.model_lbl.setText(tr("orient_model", name=names))
-            small = big = 0
-            for m in models:
-                loops = boundary_loops(m.mesh.faces) if m.mesh.n_faces else []
-                if loops:
-                    main = max(loops, key=len)
-                    for lp in loops:
-                        if lp is main:
-                            continue
-                        if loop_size(m.mesh.vertices, lp) <= self.hole_max.value():
-                            small += 1
-                        else:
-                            big += 1
-            self.holes_lbl.setText(tr("repair_found", small=small, big=big))
+        self.model_lbl.setText(tr("orient_model", name=", ".join(m.name for m in models)) if models
+                               else tr("select_model_first"))
         self.go.setEnabled(bool(models))
         self._schedule_preview()
 
@@ -293,29 +258,6 @@ class BuilderPanel(QWidget):
             voxel=float(self.quality.currentData()), edge_smooth=self.edge.value(),
             inner_smooth=self.inner.value(), auto_orient=self.auto.isChecked(),
             trim=self.trim.isChecked(), trim_offset=self.trim_off.value())
-
-    # ------------------------------------------------------------------ repair
-    def fill(self):
-        models = self.get_models()
-        if not models:
-            return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        total = 0
-        try:
-            for m in models:
-                loops = boundary_loops(m.mesh.faces)
-                keep = max(loops, key=len) if loops else None
-                fixed, filled, _ = fill_holes(m.mesh, self.hole_max.value(), keep=keep)
-                if filled:
-                    self.push_undo(m)
-                    m.set_mesh(fixed)
-                    total += filled
-        finally:
-            QApplication.restoreOverrideCursor()
-        self.result_lbl.setText(tr("repair_done", n=total))
-        self.status(tr("repair_done", n=total))
-        self.on_change()
-        self.refresh()
 
     # ------------------------------------------------------------------ build
     def build(self):

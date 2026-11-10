@@ -123,6 +123,30 @@ class Model:
     def select_color(self) -> np.ndarray:
         return SELECT_COLOR_ON_SCAN if self.has_colors and self.show_colors else SELECT_COLOR
 
+    # ---- fast in-place vertex edits (sculpting) ----
+    def begin_vertex_edit(self) -> None:
+        """Give the model its own vertex array (the old mesh stays intact for undo)."""
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+
+        self.mesh = Mesh(self.mesh.vertices.copy(), self.mesh.faces, self.mesh.colors)
+        self._pts_view = vtk_to_numpy(self.polydata.GetPoints().GetData())
+        self._nrm_view = vtk_to_numpy(self._normals) if self._normals is not None else None
+
+    def set_vertices(self, idx, local_positions, normal_idx=None, local_normals=None) -> None:
+        self.mesh.vertices[idx] = local_positions
+        self._pts_view[idx] = local_positions
+        if normal_idx is not None and self._nrm_view is not None:
+            self._nrm_view[normal_idx] = local_normals
+            self._normals.Modified()
+        pts = self.polydata.GetPoints()
+        pts.GetData().Modified()
+        pts.Modified()
+        self.polydata.Modified()
+
+    def end_vertex_edit(self) -> None:
+        self._world = None
+        self._base_key = None
+
     def set_overlay(self, face_rgb) -> None:
         """Per-face colours shown instead of the material (e.g. undercut map); None removes them."""
         cd = self.polydata.GetCellData()

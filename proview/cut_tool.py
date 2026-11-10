@@ -20,7 +20,7 @@ from .i18n import tr
 from .selection import focal_plane_point, pick_mesh, points_in_polygon, project, segment_distance, visible_mask
 from .viewer import Overlay2D
 
-BRUSH, LASSO, POLYGON = "brush", "lasso", "polygon"
+BRUSH, LASSO, POLYGON, ISLAND = "brush", "lasso", "polygon", "island"
 
 
 class CutTool:
@@ -188,6 +188,9 @@ class CutTool:
         if model is None:
             return False
         self._mouse = (x, y)
+        if self.mode == ISLAND:
+            self.select_island(model, x, y, ctrl)
+            return True
         if self.mode == BRUSH:
             self._subtract = ctrl
             self.push_selection_undo(model)
@@ -216,6 +219,8 @@ class CutTool:
 
     def on_move(self, x, y, ctrl, shift):
         self._mouse = (x, y)
+        if self.mode == ISLAND:
+            return False
         if self.mode == BRUSH:
             self.cursor.set(self._circle(x, y), closed=True)
             if self._dragging:
@@ -245,6 +250,8 @@ class CutTool:
         return False
 
     def on_release(self, x, y, ctrl, shift):
+        if self.mode == ISLAND:
+            return True
         if self.mode == BRUSH:
             self._dragging = False
             return True
@@ -278,6 +285,24 @@ class CutTool:
                 return True
         self.poly3d.append(self._pick_point(x, y))
         self.viewer.render()
+        return True
+
+    def select_island(self, model, x, y, subtract=False):
+        """Select (Ctrl: deselect) the whole separate piece under the cursor with one click."""
+        hit = pick_mesh(self.viewer.ren, x, y, model.world_geometry()[0], model.mesh.faces)
+        if hit is None:
+            return False
+        key = id(model.mesh)
+        if getattr(self, "_labels_key", None) != key:
+            self._labels = model.mesh.connected_components()[1]
+            self._labels_key = key
+        piece = self._labels == self._labels[hit[2]]
+        self.push_selection_undo(model)
+        sel = model.selection.copy()
+        sel[piece] = not subtract
+        model.set_selection(sel)
+        self.viewer.render()
+        self.on_change()
         return True
 
     def on_wheel(self, direction):
@@ -378,7 +403,8 @@ class CutPanel(QWidget):
         bl = QVBoxLayout(box)
         self.mode_group = QButtonGroup(self)
         self.mode_buttons = {}
-        for mode, key in ((BRUSH, "mode_brush"), (LASSO, "mode_lasso"), (POLYGON, "mode_polygon")):
+        for mode, key in ((BRUSH, "mode_brush"), (LASSO, "mode_lasso"), (POLYGON, "mode_polygon"),
+                          (ISLAND, "mode_island")):
             rb = QRadioButton(tr(key))
             self.mode_group.addButton(rb)
             self.mode_buttons[mode] = rb

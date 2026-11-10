@@ -158,6 +158,19 @@ _STRINGS = {
     "mode_brush": ("Brush", "فرشاة"),
     "mode_lasso": ("Lasso (freehand)", "لاسو (رسم حر)"),
     "mode_polygon": ("Points (polyline)", "نقاط موصولة"),
+    "mode_island": ("Click (whole separate piece)", "نقرة (جزء منفصل كامل)"),
+    "tool_repair": ("Repair", "إصلاح"),
+    "tile_repair": ("Repair", "إصلاح"),
+    "repair_tab": ("Repair", "إصلاح"),
+    "sculpt_title": ("Sculpt brush", "فرشاة النحت"),
+    "sculpt_add": ("Add (build up)", "إضافة"),
+    "sculpt_remove": ("Remove (carve)", "إزالة"),
+    "sculpt_smooth": ("Smooth", "تنعيم"),
+    "sculpt_size": ("Size", "الحجم"),
+    "sculpt_strength": ("Strength", "القوة"),
+    "sculpt_help": ("Left drag on the model: sculpt.  Shift + wheel: brush size.  Ctrl + wheel: strength.\n"
+                    "Right drag rotates, plain wheel zooms. Ctrl+Z undoes a stroke.",
+                    "اسحب بالزر الأيسر للنحت. Shift + العجلة للحجم، Ctrl + العجلة للقوة."),
     "brush_size": ("Brush size", "حجم الفرشاة"),
     "through": ("Cut through (include hidden faces)", "قطع نافذ (يشمل الأوجه المخفية)"),
     "delete_sel": ("Delete selection  [Del]", "حذف المحدد  [Del]"),
@@ -227,7 +240,7 @@ _STRINGS = {
     "models_tip": ("Ctrl/Shift + click to select several models (for Merge).", "Ctrl + نقر لتحديد عدة نماذج."),
     "drop_hint": ("Open or drag & drop STL / PLY files here", "افتح ملفات STL أو اسحبها وأفلتها هنا"),
     "shortcut_text": (
-        "Shift + middle click  Model see-through on/off\nCtrl + middle click  Hide model\nCtrl+O  Open\nCtrl+S  Save model\nCtrl+Z  Undo\nX  Cut tool\nA  Alignment tool\nS  Section view (measure gaps)\nO  Orientation\nU  Path of insertion / undercuts\nH  Flat (sharp) shading\nM  Merge models\nE  Show edges\nC  Scan colors\n"
+        "Shift + middle click  Model see-through on/off\nCtrl + middle click  Hide model\nCtrl+O  Open\nCtrl+S  Save model\nCtrl+Z  Undo\nX  Cut tool\nA  Alignment tool\nS  Section view (measure gaps)\nO  Orientation\nR  Repair (fill holes, sculpt: Shift+wheel size, Ctrl+wheel strength)\nU  Path of insertion / undercuts\nH  Flat (sharp) shading\nM  Merge models\nE  Show edges\nC  Scan colors\n"
         "1-6  Front / Back / Left / Right / Top / Bottom,  0  Isometric\nClick a face of the view cube to look at it\n"
         "B / L / P  Brush / Lasso / Points\nDel  Delete selection\nEsc  Cancel / clear selection\n"
         "Enter  Close points polyline\nBackspace  Remove last point\n[ ]  Brush size\nF  Fit all",

@@ -57,6 +57,12 @@
 ### مسار الإدخال والأندركت (Undercut) — زر `U`
 أدر النموذج حتى تنظر مع مسار الإدخال المطلوب ثم اضغط **Set path from current view**. يظهر سهم يوضح اتجاه الإدخال وتُلوَّن مناطق الأندركت حسب العمق (0.25 / 0.50 / 0.75 مم) مع مساحة كل درجة وأعمق أندركت. أزرار Tilt لإمالة المسار بدرجات، و Auto للمسار العمودي على المستوى الإطباقي.
 
+### الإصلاح (Repair) — زر `R`
+- **Fill holes**: سد الثقوب والأجزاء غير المكتملة حتى الحجم المحدد.
+- **فرشاة النحت**: إضافة (Add)، إزالة (Remove)، تنعيم (Smooth). اسحب بالزر الأيسر على النموذج. **Shift + العجلة** لحجم الفرشاة و **Ctrl + العجلة** للقوة. `Ctrl+Z` للتراجع عن كل سحبة.
+
+في أداة القطع: وضع **Click** (`I`) يحدد الجزء المنفصل كاملًا بنقرة واحدة.
+
 ### المواد (Materials)
 انقر على الدائرة الملونة بجانب اسم النموذج لاختيار المادة: جبس (Stone) بألوان مختلفة، زركون لامع أو مطفي، رزن، شمع، لثة، تيتانيوم، ذهب، كروم كوبالت، أو لون مخصص.
 
@@ -100,6 +106,8 @@ A Windows desktop STL viewer (Python, Qt/PySide6, VTK) with:
 **Model builder** — the scan edge is trimmed flat automatically (removes hanging tissue / folded edges; adjustable level); large models at fine quality use a coarser inner grid instead of failing; upper/lower jaws are detected automatically and every selected model or separate arch gets its own model; smooth inner surface (ball opening, never thinner than the wall) and smoothed scan edge. **Fill holes** closes holes up to a chosen size with a faired patch. One click turns a scan into a closed printable model: the open edge is extended to a flat base; optionally hollow with an open base (wall thickness) and a honeycomb inside (cell size, rib thickness). The scan surface is kept exactly; the result is watertight.
 
 **Path of insertion / undercuts (`U`)** — set the insertion axis from the current view (or auto / tilt by degrees); an arrow shows it and undercuts are coloured by horizontal depth (0.25 / 0.50 / 0.75 mm gauge classes) with areas and the deepest undercut.
+
+**Repair (`R`)** — fill holes, and sculpt brushes (add / remove / smooth) with Shift+wheel size and Ctrl+wheel strength; strokes are undoable. The Cut tool has a click mode (`I`) that selects a whole separate piece.
 
 **Materials** — click a model's colour ball: stone (ivory/blue/yellow/pink/green/grey), zirconia glossy/matte, resin, wax, gingiva, titanium, gold, cobalt-chrome, or a custom colour.
 

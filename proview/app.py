@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .align_tool import AlignController, AlignPanel
-from .cut_tool import BRUSH, LASSO, POLYGON, CutPanel, CutTool
+from .cut_tool import BRUSH, ISLAND, LASSO, POLYGON, CutPanel, CutTool
 from .i18n import set_language, tr
 from .icons import app_icon, icon
 from .mesh import MESH_EXTENSIONS, load_mesh, merge_meshes, save_mesh
@@ -31,6 +31,7 @@ from .model import MATERIALS, Model
 from .models_panel import ModelsPanel, ViewBar
 from .builder_tool import BuilderPanel
 from .orient_tool import OrientController, OrientPanel
+from .repair_tool import RepairPanel, SculptTool
 from .section_tool import SectionController, SectionPanel
 from .survey_tool import SurveyController, SurveyPanel
 from .viewer import Viewer
@@ -66,6 +67,7 @@ class MainWindow(QMainWindow):
         self.cut = CutTool(self.viewer, self.active_model, self.push_undo, self._tools_changed,
                            push_selection_undo=lambda m: self.push_selection_undo(m))
         self.section = SectionController(self.viewer, lambda: self._section_changed())
+        self.sculpt = SculptTool(self.viewer, self.active_model, self.push_undo, lambda: self._sculpt_changed())
         self.survey = SurveyController(self.viewer, lambda: self._selected_models(),
                                        lambda: self._survey_changed())
         self.orient = OrientController(self.viewer, self.active_model, self.push_undo,
@@ -95,6 +97,10 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.section_panel)
         self.orient_panel = OrientPanel(self.orient)
         self.stack.addWidget(self.orient_panel)
+        self.repair_panel = RepairPanel(self.sculpt, lambda: self._selected_models(), self.push_undo,
+                                        lambda: self._tools_changed(),
+                                        lambda text: self.statusBar().showMessage(text), settings=self.settings)
+        self.stack.addWidget(self.repair_panel)
         self.survey_panel = SurveyPanel(self.survey)
         self.stack.addWidget(self.survey_panel)
         self.builder_panel = BuilderPanel(lambda: self._selected_models(),
@@ -166,6 +172,7 @@ class MainWindow(QMainWindow):
         a_merge = self._act(tr("merge"), self.merge_models, "M", icon_name="merge")
         self.a_orient = self._act(tr("tool_orient"), self._toggle_orient, "O", checkable=True, icon_name="orient")
         self.a_builder = self._act(tr("tool_builder"), self._toggle_builder, checkable=True, icon_name="builder")
+        self.a_repair = self._act(tr("tool_repair"), self._toggle_repair, "R", checkable=True, icon_name="repair")
         self.a_survey = self._act(tr("tool_survey"), self._toggle_survey, "U", checkable=True, icon_name="survey")
         self.a_section = self._act(tr("tool_section"), self._toggle_section, "S", checkable=True,
                                    icon_name="section")
@@ -177,8 +184,9 @@ class MainWindow(QMainWindow):
         grp.addAction(self.a_orient)
         grp.addAction(self.a_builder)
         grp.addAction(self.a_survey)
+        grp.addAction(self.a_repair)
         mt = mb.addMenu(tr("menu_tools"))
-        for a in (self.a_cut, self.a_align, self.a_section, self.a_orient, self.a_builder, self.a_survey, a_merge):
+        for a in (self.a_cut, self.a_align, self.a_section, self.a_orient, self.a_repair, self.a_builder, self.a_survey, a_merge):
             mt.addAction(a)
 
         a_help = self._act(tr("shortcuts"), lambda: QMessageBox.information(self, tr("shortcuts"), tr("shortcut_text")),
@@ -202,6 +210,7 @@ class MainWindow(QMainWindow):
         tiles = [
             (self.a_cut, tr("tile_cut")), (self.a_align, tr("tile_align")),
             (self.a_section, tr("tile_section")), (self.a_orient, tr("tile_orient")),
+            (self.a_repair, tr("tile_repair")),
             (self.a_builder, tr("tile_builder")), (self.a_survey, tr("tile_survey")),
             (a_merge, tr("tile_merge")),
         ]
@@ -250,6 +259,7 @@ class MainWindow(QMainWindow):
         sc("B", lambda: self._cut_mode(BRUSH))
         sc("L", lambda: self._cut_mode(LASSO))
         sc("P", lambda: self._cut_mode(POLYGON))
+        sc("I", lambda: self._cut_mode(ISLAND))
         sc("[", lambda: self._brush_size(1 / 1.2))
         sc("]", lambda: self._brush_size(1.2))
 
@@ -361,6 +371,8 @@ class MainWindow(QMainWindow):
             self.builder_panel.selection_changed()
         if self.survey.active:
             self.survey.update()
+        if self.a_repair.isChecked():
+            self.repair_panel.refresh()
         for other in self.viewer.models:
             if other is not m and other.selection.any():
                 other.clear_selection()
@@ -538,6 +550,24 @@ class MainWindow(QMainWindow):
             if not self._any_panel_tool():
                 self.tools_dock.hide()
 
+    def _toggle_repair(self, on):
+        if on:
+            self.align.stop_picking()
+            self.stack.setCurrentWidget(self.repair_panel)
+            self.tools_dock.setWindowTitle(tr("repair_tab"))
+            self.tools_dock.show()
+            self.sculpt.activate()
+            self.repair_panel.refresh()
+        else:
+            self.sculpt.deactivate()
+            if not self._any_panel_tool():
+                self.tools_dock.hide()
+
+    def _sculpt_changed(self):
+        if hasattr(self, "repair_panel"):
+            self.repair_panel.sync()
+            self._update_info()
+
     def _toggle_survey(self, on):
         if on:
             self.align.stop_picking()
@@ -569,7 +599,7 @@ class MainWindow(QMainWindow):
 
     def _any_panel_tool(self):
         return any(a.isChecked() for a in (self.a_cut, self.a_align, self.a_section, self.a_orient,
-                                           self.a_builder, self.a_survey))
+                                           self.a_builder, self.a_survey, self.a_repair))
 
     def _toggle_builder(self, on):
         if on:

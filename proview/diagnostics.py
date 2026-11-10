@@ -74,6 +74,16 @@ def route_vtk_messages() -> None:
         log(f"could not redirect VTK output: {exc}")
 
 
+def project_center(viewer, model):
+    """Display position of the model's centre (a point that is on the model for the test shapes)."""
+    import numpy as np
+
+    from .selection import project
+
+    lo, hi = model.world_bounds()
+    return project(viewer.ren, ((lo + hi) / 2)[None])[0, :2]
+
+
 def run_selftest(win, app, out_png: str) -> None:
     """Exercise the main features, save a screenshot and quit (exit code 0 = ok)."""
     import numpy as np
@@ -147,6 +157,24 @@ def run_selftest(win, app, out_png: str) -> None:
         fill_holes(holed, 5.0)
         assert built.n_faces > 0
         log("selftest: model builder ok")
+        m0 = win.viewer.models[0]
+        win.model_list.setCurrentRow(0)
+        win.a_cut.setChecked(True)
+        cpt = project_center(win.viewer, m0)
+        win.cut.select_island(m0, cpt[0], cpt[1])
+        win.cut.clear()
+        win.a_cut.setChecked(False)
+        win.a_repair.setChecked(True)
+        for mode in ("add", "remove", "smooth"):
+            win.sculpt.mode = mode
+            if win.sculpt.on_press(cpt[0], cpt[1], False, False, 0):
+                win.sculpt.on_move(cpt[0] + 4, cpt[1] + 3, False, False)
+                win.sculpt.on_release(cpt[0] + 4, cpt[1] + 3, False, False)
+        win.sculpt.on_wheel_mod(1, False, True)
+        win.sculpt.on_wheel_mod(1, True, False)
+        win.undo()
+        win.a_repair.setChecked(False)
+        log("selftest: island select + sculpt ok")
         win.a_survey.setChecked(True)
         win.survey.set_from_view()
         win.survey.tilt("x", 5)
