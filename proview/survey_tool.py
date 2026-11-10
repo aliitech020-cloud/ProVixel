@@ -71,7 +71,7 @@ class SurveyController:
                 wv = m.world_geometry()[0]
                 loops = boundary_loops(m.mesh.faces)
                 if loops:
-                    d = detect_up(wv, max(loops, key=len))
+                    d = detect_up(wv, max(loops, key=len), m.mesh.faces)
                     break
             except Exception:  # noqa: BLE001
                 d = None

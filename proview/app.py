@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QToolBar,
@@ -91,24 +92,24 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.cut_panel = CutPanel(self.cut)  # shown inside the Repair tab
         self.align_panel = AlignPanel(self.align, lambda: list(self.viewer.models))
-        self.stack.addWidget(self.align_panel)
+        self.stack.addWidget(_scrolled(self.align_panel))
         self.section_panel = SectionPanel(self.section, lambda: list(self.viewer.models))
-        self.stack.addWidget(self.section_panel)
+        self.stack.addWidget(_scrolled(self.section_panel))
         self.orient_panel = OrientPanel(self.orient)
-        self.stack.addWidget(self.orient_panel)
+        self.stack.addWidget(_scrolled(self.orient_panel))
         self.repair_panel = RepairPanel(self.sculpt, self.cut, self.cut_panel, lambda: self._selected_models(),
                                         self.push_undo,
                                         lambda: self._tools_changed(),
                                         lambda text: self.statusBar().showMessage(text), settings=self.settings)
-        self.stack.addWidget(self.repair_panel)
+        self.stack.addWidget(_scrolled(self.repair_panel))
         self.survey_panel = SurveyPanel(self.survey)
-        self.stack.addWidget(self.survey_panel)
+        self.stack.addWidget(_scrolled(self.survey_panel))
         self.builder_panel = BuilderPanel(lambda: self._selected_models(),
                                           lambda src, mesh, part, first: self._add_built(src, mesh, part, first),
                                           lambda text: self.statusBar().showMessage(text),
                                           self.push_undo, lambda: self._tools_changed(),
                                           viewer=self.viewer, settings=self.settings)
-        self.stack.addWidget(self.builder_panel)
+        self.stack.addWidget(_scrolled(self.builder_panel))
         self.tools_dock.setWidget(self.stack)
         self.tools_dock.setMinimumWidth(300)
         self.addDockWidget(Qt.RightDockWidgetArea, self.tools_dock)
@@ -520,7 +521,7 @@ class MainWindow(QMainWindow):
     # ============================================================= tools
     def _toggle_align(self, on):
         if on:
-            self.stack.setCurrentWidget(self.align_panel)
+            self.stack.setCurrentWidget(self.align_panel._scroll)
             self.tools_dock.setWindowTitle(tr("align_title"))
             self.tools_dock.show()
             self.align_panel.refresh_models()
@@ -532,7 +533,7 @@ class MainWindow(QMainWindow):
     def _toggle_section(self, on):
         if on:
             self.align.stop_picking()
-            self.stack.setCurrentWidget(self.section_panel)
+            self.stack.setCurrentWidget(self.section_panel._scroll)
             self.tools_dock.setWindowTitle(tr("section_title"))
             self.tools_dock.setMinimumWidth(380)
             self.tools_dock.show()
@@ -547,7 +548,7 @@ class MainWindow(QMainWindow):
     def _toggle_repair(self, on):
         if on:
             self.align.stop_picking()
-            self.stack.setCurrentWidget(self.repair_panel)
+            self.stack.setCurrentWidget(self.repair_panel._scroll)
             self.tools_dock.setWindowTitle(tr("repair_tab"))
             self.tools_dock.show()
             self.repair_panel.set_active(True)
@@ -571,7 +572,7 @@ class MainWindow(QMainWindow):
     def _toggle_survey(self, on):
         if on:
             self.align.stop_picking()
-            self.stack.setCurrentWidget(self.survey_panel)
+            self.stack.setCurrentWidget(self.survey_panel._scroll)
             self.tools_dock.setWindowTitle(tr("survey_title"))
             self.tools_dock.show()
             self.survey.activate()
@@ -587,7 +588,7 @@ class MainWindow(QMainWindow):
     def _toggle_orient(self, on):
         if on:
             self.align.stop_picking()
-            self.stack.setCurrentWidget(self.orient_panel)
+            self.stack.setCurrentWidget(self.orient_panel._scroll)
             self.tools_dock.setWindowTitle(tr("orient_title"))
             self.tools_dock.show()
             self.orient.activate()
@@ -604,7 +605,7 @@ class MainWindow(QMainWindow):
     def _toggle_builder(self, on):
         if on:
             self.align.stop_picking()
-            self.stack.setCurrentWidget(self.builder_panel)
+            self.stack.setCurrentWidget(self.builder_panel._scroll)
             self.tools_dock.setWindowTitle(tr("builder_title"))
             self.tools_dock.show()
             self.builder_panel.set_active(True)
@@ -739,6 +740,17 @@ class MainWindow(QMainWindow):
         self.view_bar.close()
         self.viewer.Finalize()
         super().closeEvent(ev)
+
+
+def _scrolled(panel):
+    """Put a tool panel in a vertical scroll area so it is usable on short screens."""
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QScrollArea.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    area.setWidget(panel)
+    panel._scroll = area
+    return area
 
 
 def _apply_dark_theme(app: QApplication):

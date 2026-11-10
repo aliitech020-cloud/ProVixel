@@ -282,7 +282,7 @@ def build_model(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> M
     R = np.eye(3)
     if opts.auto_orient:
         # teeth direction: away from the plane of the open edge, towards the bulk of the scan
-        R = rotation_to_z(detect_up(v, main))
+        R = rotation_to_z(detect_up(v, main, scan.faces))
         scan = Mesh(v @ R.T, scan.faces, scan.colors)
         v = scan.vertices
     edge_z = v[main][:, 2].mean()
@@ -371,35 +371,88 @@ def build_model(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> M
     return result
 
 
-def detect_up(v: np.ndarray, edge_loop) -> np.ndarray:
+def _fibonacci_hemisphere(n: int) -> np.ndarray:
+    i = np.arange(n) + 0.5
+    z = i / n
+    r = np.sqrt(1 - z * z)
+    a = np.pi * (1 + 5 ** 0.5) * i
+    return np.stack([r * np.cos(a), r * np.sin(a), z], 1)
+
+
+def _height_field_scores(v, faces, dirs, max_faces=12_000):
+    """How well the surface looks like a single layer seen along each direction.
+
+    Score = shadow area / summed projected area of all triangles: 1 when nothing overlaps
+    (a scan seen from the side it was scanned from), well below 1 from the side, where the
+    front and back walls of the arch cover each other.
+    """
+    f = faces
+    if len(f) > max_faces:
+        f = f[np.random.default_rng(0).choice(len(f), max_faces, replace=False)]
+    tri = v[f]
+    cr = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])  # 2 * area * normal
+    pts = np.vstack([tri.mean(1), tri[:, 0], tri[:, 1], tri[:, 2]])
+    total = np.linalg.norm(cr, axis=1).sum() / 2
+    g = np.sqrt(total / len(pts)) * 2.0
+    if not g > 0:
+        return np.zeros(len(dirs))
+    out = np.zeros(len(dirs))
+    for k, d in enumerate(dirs):
+        b = np.cross(d, [1.0, 0.0, 0.0] if abs(d[0]) < 0.9 else [0.0, 1.0, 0.0])
+        b /= np.linalg.norm(b)
+        c = np.cross(d, b)
+        q = np.floor(np.stack([pts @ b, pts @ c], 1) / g).astype(np.int64)
+        q -= q.min(0)
+        shadow = len(np.unique(q[:, 0] * (q[:, 1].max() + 1) + q[:, 1])) * g * g
+        proj = np.abs(cr @ d).sum() / 2
+        out[k] = shadow / proj if proj > 0 else 0.0
+    return out
+
+
+def detect_up(v: np.ndarray, edge_loop, faces=None) -> np.ndarray:
     """Unit vector pointing from the scan's open edge towards the teeth.
 
-    The direction is the thin axis of the whole arch (an arch is wide and deep but not
-    tall); its sign points away from the open edge. The edge itself is too uneven
-    (it rises at the back of the arch, flaps hang down) to define the direction.
+    A scan is a single layer when seen from the side it was scanned from (the teeth side)
+    and overlaps itself from any other side, whatever the proportions of the arch
+    (edentulous ridges with deep flanges can be taller than the arch is deep). The
+    direction with the least overlap is used; its sign points away from the open edge.
+    Without faces, the thin axis of the arch is used.
     """
     sample = v if len(v) <= 200_000 else v[np.random.default_rng(0).choice(len(v), 200_000, replace=False)]
     c = sample.mean(0)
     _, vecs = np.linalg.eigh(np.cov((sample - c).T))
     n = vecs[:, 0]
+    if faces is not None and len(faces) >= 20:
+        # prior: the normal of the area enclosed by the open edge. Good for flat scans, where
+        # many directions show no overlap; tilted by tall open ends, which the overlap fixes
+        p = v[edge_loop] - v[edge_loop].mean(0)
+        area = 0.5 * np.cross(p, np.roll(p, -1, 0)).sum(0)
+        if np.linalg.norm(area) > 1e-3 * _loop_length(v, edge_loop) ** 2:
+            n = area / np.linalg.norm(area)
+
+        top = [0.0]
+
+        def best_of(dirs):
+            # of the directions about as free of overlap as the best one, the one nearest the prior
+            sc = _height_field_scores(v, faces, dirs)
+            top[0] = max(top[0], float(sc.max()))
+            ok = sc >= top[0] - 0.03
+            if not ok.any():
+                return dirs[int(np.argmax(sc))]
+            cand = dirs[ok]
+            return cand[int(np.argmax(np.abs(cand @ n)))]
+
+        best = best_of(_fibonacci_hemisphere(300))
+        for step in (4.0, 1.5):  # finer search around the best direction
+            t = np.cross(best, [1.0, 0.0, 0.0] if abs(best[0]) < 0.9 else [0.0, 1.0, 0.0])
+            t /= np.linalg.norm(t)
+            w = np.cross(best, t)
+            ring = [np.cos(np.radians(step)) * best + np.sin(np.radians(step)) * (np.cos(a) * t + np.sin(a) * w)
+                    for a in np.radians(np.arange(0, 360, 45))]
+            best = best_of(np.array([best] + ring))
+        n = best / np.linalg.norm(best)
     if ((v[edge_loop] - c) @ n).mean() > 0:
         n = -n
-    # refine with the occlusal plane: the highest points (cusp tips, incisal edges)
-    for _ in range(4):
-        h = (sample - c) @ n
-        top = sample[h >= np.quantile(h, 0.9)]
-        if len(top) < 10:
-            break
-        tc = top.mean(0)
-        tw, tv = np.linalg.eigh(np.cov((top - tc).T))
-        if tw[0] > 0.15 * tw[1]:  # the top points are not plane-like (not a dental arch): keep
-            break
-        m = tv[:, 0]
-        if m @ n < 0:
-            m = -m
-        if np.degrees(np.arccos(np.clip(m @ n, -1, 1))) > 45:  # implausible jump: keep
-            break
-        n = m
     return n / np.linalg.norm(n)
 
 
@@ -416,7 +469,7 @@ def base_frame(scan: Mesh, opts: "BuildOptions"):
         raise BuildError("The model is already closed (no open edge). Use a scan, not a solid model.")
     v = scan.vertices
     main = max(loops, key=lambda lp: _loop_length(v, lp))
-    R = rotation_to_z(detect_up(v, main)) if opts.auto_orient else np.eye(3)
+    R = rotation_to_z(detect_up(v, main, scan.faces)) if opts.auto_orient else np.eye(3)
     z_cut = trim_level(v @ R.T, main, opts) if opts.trim else None
     return R, main, z_cut
 
