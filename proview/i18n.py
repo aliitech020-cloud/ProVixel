@@ -163,9 +163,15 @@ _STRINGS = {
     "tile_repair": ("Repair", "إصلاح"),
     "repair_tab": ("Repair", "إصلاح"),
     "sculpt_title": ("Sculpt brush", "فرشاة النحت"),
-    "sculpt_add": ("Add (build up)", "إضافة"),
-    "sculpt_remove": ("Remove (carve)", "إزالة"),
-    "sculpt_smooth": ("Smooth", "تنعيم"),
+    "repair_tool_cut": ("Cut", "قطع"),
+    "repair_tool_build": ("Add / Carve", "إضافة / حفر"),
+    "repair_tool_smooth": ("Smooth", "تنعيم"),
+    "sculpt_help_build": ("Left drag on the model: build up (green).  Hold Shift while dragging: carve (red).\n"
+                          "Shift + wheel: size.  Ctrl + wheel: strength.  Right drag rotates.  Ctrl+Z undoes a stroke.",
+                          "اسحب للإضافة، ومع Shift للحفر."),
+    "sculpt_help_smooth": ("Left drag on the model: smooth (blue).  Hold Shift while dragging: strong smoothing "
+                           "(purple).\nShift + wheel: size.  Ctrl + wheel: strength.  Ctrl+Z undoes a stroke.",
+                           "اسحب للتنعيم، ومع Shift تنعيم قوي."),
     "sculpt_size": ("Size", "الحجم"),
     "sculpt_strength": ("Strength", "القوة"),
     "sculpt_help": ("Left drag on the model: sculpt.  Shift + wheel: brush size.  Ctrl + wheel: strength.\n"

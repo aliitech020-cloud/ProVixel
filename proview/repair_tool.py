@@ -1,8 +1,10 @@
-"""Repair tab: fill holes and sculpt brushes (add / remove / smooth)."""
+"""Repair tab: cut, fill holes and sculpt brushes (build up / carve, smooth)."""
 from __future__ import annotations
 
+import time
+
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -11,65 +13,194 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QRadioButton,
     QSlider,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from scipy.sparse import coo_matrix, diags
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+from vtkmodules.vtkCommonTransforms import vtkTransform
+from vtkmodules.vtkFiltersCore import vtkTubeFilter
+from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
+from vtkmodules.vtkFiltersSources import vtkArrowSource, vtkDiskSource
+from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
 
 from .i18n import tr
+from .icons import icon
 from .mesh import Mesh, transform_points
-from .model_builder import boundary_loops
+from .model import numpy_to_vtk_matrix
+from .model_builder import boundary_loops, rotation_to_z
 from .repair import fill_holes, loop_size, vertex_adjacency
-from .selection import pick_mesh, project
-from .viewer import Overlay2D
+from .selection import pick_mesh
 
-ADD, REMOVE, SMOOTH = "add", "remove", "smooth"
+BUILD, SMOOTH = "build", "smooth"
+# brush colours: build up, carve, smooth, strong smooth
+COLOR_ADD = (0.30, 0.90, 0.45)
+COLOR_CARVE = (1.00, 0.38, 0.30)
+COLOR_SMOOTH = (0.35, 0.68, 1.00)
+COLOR_SMOOTH_STRONG = (0.62, 0.45, 1.00)
+
+
+class BrushCursor:
+    """3D brush on the surface: a ring + translucent disc lying on the surface (size),
+    the disc's opacity shows the strength, and an arrow shows what the brush does."""
+
+    def __init__(self, renderer):
+        self.ren = renderer
+        # unit ring in the XY plane
+        t = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+        pts = vtkPoints()
+        for a in t:
+            pts.InsertNextPoint(np.cos(a), np.sin(a), 0.0)
+        lines = vtkCellArray()
+        lines.InsertNextCell(len(t) + 1)
+        for i in range(len(t)):
+            lines.InsertCellPoint(i)
+        lines.InsertCellPoint(0)
+        pd = vtkPolyData()
+        pd.SetPoints(pts)
+        pd.SetLines(lines)
+        tube = vtkTubeFilter()
+        tube.SetInputData(pd)
+        tube.SetRadius(0.035)
+        tube.SetNumberOfSides(8)
+        self.ring = self._actor(tube)
+        disk = vtkDiskSource()
+        disk.SetInnerRadius(0.0)
+        disk.SetOuterRadius(1.0)
+        disk.SetCircumferentialResolution(48)
+        self.disc = self._actor(disk)
+        # unit arrow along +Z, starting at the origin
+        arrow = vtkArrowSource()
+        arrow.SetShaftRadius(0.06)
+        arrow.SetTipRadius(0.16)
+        arrow.SetTipLength(0.35)
+        tr_ = vtkTransform()
+        tr_.RotateY(-90)
+        f = vtkTransformPolyDataFilter()
+        f.SetInputConnection(arrow.GetOutputPort())
+        f.SetTransform(tr_)
+        self.arrow = self._actor(f)
+        for a in (self.ring, self.disc, self.arrow):
+            a.GetProperty().SetLighting(False)
+        self.ring.GetProperty().SetLighting(True)
+        self.arrow.GetProperty().SetLighting(True)
+        self.shown = False
+
+    @staticmethod
+    def _actor(src):
+        m = vtkPolyDataMapper()
+        m.SetInputConnection(src.GetOutputPort())
+        m.SetResolveCoincidentTopologyToPolygonOffset()
+        a = vtkActor()
+        a.SetMapper(m)
+        a.PickableOff()
+        return a
+
+    def place(self, center, normal, radius, strength, color, arrow_sign):
+        n = np.asarray(normal, float)
+        n = n / (np.linalg.norm(n) or 1.0)
+        Rn = rotation_to_z(n).T  # maps +Z onto the normal
+        M = np.eye(4)
+        M[:3, :3] = Rn * radius
+        M[:3, 3] = np.asarray(center) + n * 0.03 * radius
+        self.ring.SetUserMatrix(numpy_to_vtk_matrix(M))
+        self.disc.SetUserMatrix(numpy_to_vtk_matrix(M))
+        # arrow: out of the surface (build up), into it (carve) or flat on it (smooth)
+        A = np.eye(4)
+        if arrow_sign == 0:
+            A[:3, :3] = Rn * radius * 0.45
+            A[:3, 3] = np.asarray(center) + n * 0.1 * radius
+            self.arrow.SetVisibility(False)
+        else:
+            Ra = rotation_to_z(n * arrow_sign).T
+            A[:3, :3] = Ra * radius * 0.9
+            start = np.asarray(center) + (n * radius * 0.95 if arrow_sign < 0 else n * 0.05 * radius)
+            A[:3, 3] = start
+            self.arrow.SetVisibility(True)
+        self.arrow.SetUserMatrix(numpy_to_vtk_matrix(A))
+        for a in (self.ring, self.arrow):
+            a.GetProperty().SetColor(*color)
+        dp = self.disc.GetProperty()
+        dp.SetColor(*color)
+        dp.SetOpacity(0.10 + 0.35 * float(strength))
+        if not self.shown:
+            for a in (self.disc, self.ring, self.arrow):
+                self.ren.AddActor(a)
+            self.shown = True
+
+    def hide(self):
+        if self.shown:
+            for a in (self.disc, self.ring, self.arrow):
+                self.ren.RemoveActor(a)
+            self.shown = False
 
 
 class SculptTool:
-    """Left drag sculpts the active model; Shift + wheel = size, Ctrl + wheel = strength."""
+    """Left drag sculpts the active model.
+    Build mode: build up; hold Shift while dragging to carve. Smooth mode: Shift = strong smoothing.
+    Shift + wheel = size, Ctrl + wheel = strength."""
 
     def __init__(self, viewer, get_model, push_undo, on_change):
         self.viewer = viewer
         self.get_model = get_model
         self.push_undo = push_undo
         self.on_change = on_change
-        self.mode = SMOOTH
+        self.mode = BUILD
         self.radius = 2.0  # mm
         self.strength = 0.5  # 0..1
         self.active = False
-        self.cursor = Overlay2D(viewer.ren, color=(1.0, 1.0, 1.0), width=1.5)
-        self.cursor.set_visible(False)
+        self.cursor = BrushCursor(viewer.ren)
         self._s = None  # stroke state
-        self._topo = {}  # cached per-topology matrices
+        self._topo = {}
+        self._local = None
         self._mouse = None
+        self._last_full_pick = 0.0
+        self._last_hit = None  # (point, normal)
+        self._shift = False
 
     # ------------------------------------------------------------ lifecycle
-    def activate(self):
+    def activate(self, mode=None):
+        if mode is not None:
+            self.mode = mode
         self.active = True
         self.viewer.style.tool = self
-        self.cursor.set_visible(True)
+        self.viewer.render()
 
     def deactivate(self):
-        self.active = False
         self._end()
+        self.active = False
         if self.viewer.style.tool is self:
             self.viewer.style.tool = None
-        self.cursor.clear()
-        self.cursor.set_visible(False)
+        self.cursor.hide()
         self._topo = {}
         self._local = None
         self.viewer.render()
 
     def set_radius(self, r):
         self.radius = float(np.clip(r, 0.2, 30.0))
+        self._refresh_cursor()
         self.on_change()
 
     def set_strength(self, s):
         self.strength = float(np.clip(s, 0.02, 1.0))
+        self._refresh_cursor()
         self.on_change()
+
+    def _style(self, shift):
+        """(colour, arrow sign, label) of the current action."""
+        if self.mode == BUILD:
+            return (COLOR_CARVE, -1) if shift else (COLOR_ADD, 1)
+        return (COLOR_SMOOTH_STRONG, 0) if shift else (COLOR_SMOOTH, 0)
+
+    def _refresh_cursor(self):
+        if self._last_hit is not None and self.active:
+            c, n = self._last_hit
+            color, sign = self._style(self._shift)
+            self.cursor.place(c, n, self.radius, self.strength, color, sign)
+            self.viewer.render()
 
     # ------------------------------------------------------------ helpers
     def _topology(self, mesh: Mesh, need_w: bool):
@@ -78,11 +209,10 @@ class SculptTool:
         if t is None:
             f = mesh.faces
             m, n = len(f), mesh.n_vertices
-            rows = f.ravel()
-            cols = np.repeat(np.arange(m), 3)
-            inc = coo_matrix((np.ones(3 * m, np.float32), (rows, cols)), shape=(n, m)).tocsr()
-            t = {"inc": inc, "w": None, "faces": f}
-            self._topo = {key: t}  # keep one
+            inc = coo_matrix((np.ones(3 * m, np.float32), (f.ravel(), np.repeat(np.arange(m), 3))),
+                             shape=(n, m)).tocsr()
+            t = {"inc": inc, "w": None}
+            self._topo = {key: t}
         if need_w and t["w"] is None:
             a = vertex_adjacency(mesh.n_vertices, mesh.faces)
             deg = np.asarray(a.sum(1)).ravel()
@@ -90,28 +220,42 @@ class SculptTool:
             t["w"] = (diags(1.0 / deg) @ a).tocsr()
         return t
 
-    def _pick(self, wv, faces, x, y):
-        """Ray pick that only tests the triangles near the last hit (fast on large scans)."""
+    def _pick(self, wv, faces, x, y, allow_full=True):
+        """(point, unit normal facing the camera) under the cursor. Only triangles near the last
+        hit are tested when possible, so it stays fast on large scans."""
         ren = self.viewer.ren
-        loc = getattr(self, "_local", None)
-        hit = None
+        loc = self._local
+        hit = tri = None
         if loc is not None and loc["faces_id"] == id(faces):
-            hit = pick_mesh(ren, x, y, wv[loc["vidx"]], loc["faces"])
-            if hit is not None and np.linalg.norm(hit[1] - loc["center"]) < loc["reach"] - self.radius:
-                return hit
-        if hit is None:  # outside the local patch: test the whole model
+            lv = wv[loc["vidx"]]
+            hit = pick_mesh(ren, x, y, lv, loc["faces"])
+            if hit is not None:
+                tri = lv[loc["faces"][hit[2]]]
+                if np.linalg.norm(hit[1] - loc["center"]) < loc["reach"] - self.radius:
+                    return hit[1], self._normal(tri)
+        if hit is None:
+            if not allow_full:
+                return None
             hit = pick_mesh(ren, x, y, wv, faces)
             if hit is None:
                 return None
-        # (re)centre the local patch on the hit
+            tri = wv[faces[hit[2]]]
         c = hit[1]
         reach = max(2.5 * self.radius, 2.0)
         near_v = np.einsum("ij,ij->i", wv - c, wv - c) < reach ** 2
         sub = faces[near_v[faces[:, 0]] | near_v[faces[:, 1]] | near_v[faces[:, 2]]]
-        vidx, inv = np.unique(sub.ravel(), return_inverse=True)  # compact: only nearby vertices
+        vidx, inv = np.unique(sub.ravel(), return_inverse=True)
         self._local = {"faces_id": id(faces), "vidx": vidx, "faces": inv.reshape(-1, 3), "center": c,
                        "reach": reach}
-        return hit
+        return c, self._normal(tri)
+
+    def _normal(self, tri):
+        n = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+        n /= np.linalg.norm(n) or 1.0
+        cam = np.array(self.viewer.ren.GetActiveCamera().GetPosition())
+        if n @ (cam - tri[0]) < 0:
+            n = -n
+        return n
 
     def _begin(self, model):
         self.push_undo(model)
@@ -121,6 +265,7 @@ class SculptTool:
         tri = wv[mesh.faces]
         fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
         topo = self._topology(mesh, self.mode == SMOOTH)
+        self._local = None
         self._s = {"model": model, "wv": wv, "fn": fn, "topo": topo,
                    "Minv": np.linalg.inv(model.matrix), "R": model.matrix[:3, :3].copy()}
 
@@ -130,46 +275,34 @@ class SculptTool:
             self._s = None
             self.on_change()
 
-    def _pixel_radius(self, center):
-        cam = self.viewer.ren.GetActiveCamera()
-        up = np.array(cam.GetViewUp(), float)
-        up /= np.linalg.norm(up)
-        p = project(self.viewer.ren, np.array([center, center + up * self.radius]))[:, :2]
-        return float(np.linalg.norm(p[1] - p[0]))
-
-    def _draw_cursor(self, x, y, center=None):
-        r = self._pixel_radius(center) if center is not None else getattr(self, "_last_px", 25.0)
-        self._last_px = r
-        t = np.linspace(0, 2 * np.pi, 48, endpoint=False)
-        self.cursor.set(np.stack([x + r * np.cos(t), y + r * np.sin(t)], 1), closed=True)
-
-    def _apply(self, x, y):
+    def _apply(self, x, y, shift):
         s = self._s
         model = s["model"]
         wv, faces = s["wv"], model.mesh.faces
-        hit = self._pick(wv, faces, x, y)
-        if hit is None:
+        res = self._pick(wv, faces, x, y)
+        if res is None:
             return None
-        c = hit[1]
+        c, nrm = res
         d2 = np.einsum("ij,ij->i", wv - c, wv - c)
         idx = np.nonzero(d2 < self.radius ** 2)[0]
         if len(idx) == 0:
-            return c
+            return c, nrm
         fall = (1.0 - d2[idx] / self.radius ** 2) ** 2
-        inc = s["topo"]["inc"]
+        topo = s["topo"]
+        inc = topo["inc"]
         if self.mode == SMOOTH:
-            target = s["topo"]["w"][idx] @ wv
-            wv[idx] += (self.strength * fall)[:, None] * (target - wv[idx])
+            strength = min(1.0, self.strength * (2.5 if shift else 1.0))
+            for _ in range(3 if shift else 1):  # Shift: strong smoothing
+                target = topo["w"][idx] @ wv
+                wv[idx] += (strength * fall)[:, None] * (target - wv[idx])
         else:
             n = inc[idx] @ s["fn"]
             n = (n * fall[:, None]).sum(0)
             ln = np.linalg.norm(n)
             if ln > 0:
                 n /= ln
-                sign = 1.0 if self.mode == ADD else -1.0
-                step = sign * self.strength * self.radius * 0.06
-                wv[idx] += (step * fall)[:, None] * n
-        # refresh normals around the edited vertices
+                sign = -1.0 if shift else 1.0  # Shift: carve
+                wv[idx] += (sign * self.strength * self.radius * 0.06 * fall)[:, None] * n
         touched = np.unique(inc[idx].indices)
         tri = wv[faces[touched]]
         s["fn"][touched] = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
@@ -178,9 +311,22 @@ class SculptTool:
         ln = np.linalg.norm(vn, axis=1, keepdims=True)
         ln[ln == 0] = 1.0
         vn = vn / ln
-        local = transform_points(s["Minv"], wv[idx])
-        model.set_vertices(idx, local, ring, vn @ s["R"])
-        return c
+        model.set_vertices(idx, transform_points(s["Minv"], wv[idx]), ring, vn @ s["R"])
+        # cursor follows the average normal of the brushed area
+        an = vn.mean(0) if len(vn) else nrm
+        if np.linalg.norm(an) > 0 and an @ nrm > 0:
+            nrm = an / np.linalg.norm(an)
+        return c, nrm
+
+    def _show(self, res, shift):
+        self._shift = shift
+        if res is None:
+            self._last_hit = None
+            self.cursor.hide()
+            return
+        self._last_hit = res
+        color, sign = self._style(shift)
+        self.cursor.place(res[0], res[1], self.radius, self.strength, color, sign)
 
     # ------------------------------------------------------------ events
     def on_press(self, x, y, ctrl, shift, repeat):
@@ -188,32 +334,33 @@ class SculptTool:
         if model is None or not model.visible:
             return False
         if self._pick(model.world_geometry()[0], model.mesh.faces, x, y) is None:
-            return False  # clicked beside the model: rotate the camera
+            return False  # beside the model: rotate the camera
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             self._begin(model)
         finally:
             QApplication.restoreOverrideCursor()
-        c = self._apply(x, y)
-        self._draw_cursor(x, y, c)
+        self._show(self._apply(x, y, shift), shift)
         self.viewer.render()
         return True
 
     def on_move(self, x, y, ctrl, shift):
         self._mouse = (x, y)
         if self._s is not None:
-            c = self._apply(x, y)
-            self._draw_cursor(x, y, c)
+            self._show(self._apply(x, y, shift), shift)
             self.viewer.render()
             return True
         model = self.get_model()
-        c = None
+        res = None
         if model is not None and model.visible:
-            loc = getattr(self, "_local", None)
-            if loc is not None and loc["faces_id"] == id(model.mesh.faces):  # cheap: near the last hit only
-                hit = pick_mesh(self.viewer.ren, x, y, model.world_geometry()[0][loc["vidx"]], loc["faces"])
-                c = hit[1] if hit else None
-        self._draw_cursor(x, y, c)
+            now = time.monotonic()
+            allow_full = now - self._last_full_pick > 0.12  # a full pick at most ~8x per second
+            res = self._pick(model.world_geometry()[0], model.mesh.faces, x, y, allow_full=allow_full)
+            if allow_full:
+                self._last_full_pick = now
+            if res is None and not allow_full and self._last_hit is not None:
+                res = self._last_hit
+        self._show(res, shift)
         self.viewer.render()
         return False
 
@@ -235,28 +382,87 @@ class SculptTool:
             self.set_strength(self.strength + (0.05 if direction > 0 else -0.05))
         else:
             return False
-        if self._mouse:
-            self._last_px = getattr(self, "_last_px", 25.0) * (1.12 if shift and direction > 0 else
-                                                              1 / 1.12 if shift else 1.0)
-            self._draw_cursor(*self._mouse)
-            self.viewer.render()
         return True
 
 
 class RepairPanel(QWidget):
-    def __init__(self, sculpt: SculptTool, get_models, push_undo, on_change, status, settings=None, parent=None):
+    """Cut, hole filling and sculpting in one tab."""
+
+    TOOLS = ("cut", BUILD, SMOOTH)
+
+    def __init__(self, sculpt: SculptTool, cut, cut_panel, get_models, push_undo, on_change, status,
+                 settings=None, parent=None):
         super().__init__(parent)
         self.sculpt = sculpt
+        self.cut = cut
+        self.cut_panel = cut_panel
         self.get_models = get_models
         self.push_undo = push_undo
         self.on_change = on_change
         self.status = status
         self.settings = settings
+        self.active = False
+        self.tool = "cut"
         lay = QVBoxLayout(self)
         self.model_lbl = QLabel("")
         self.model_lbl.setWordWrap(True)
         self.model_lbl.setStyleSheet("font-weight:bold;")
         lay.addWidget(self.model_lbl)
+
+        # ---------------- tool selector
+        row = QHBoxLayout()
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.tool_buttons = {}
+        for name, key, ic in (("cut", "repair_tool_cut", "cut"), (BUILD, "repair_tool_build", "sculpt_build"),
+                              (SMOOTH, "repair_tool_smooth", "sculpt_smooth")):
+            b = QToolButton()
+            b.setText(tr(key))
+            b.setIcon(icon(ic))
+            b.setIconSize(QSize(26, 26))
+            b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            b.setCheckable(True)
+            b.setMinimumSize(92, 58)
+            b.setStyleSheet("QToolButton { background:#25282f; border:1px solid #30343c; border-radius:9px;"
+                            " padding:4px; } QToolButton:hover { border-color:#4a90e2; }"
+                            " QToolButton:checked { background:#1d3a5e; border:1px solid #4aa3ff; }")
+            b.toggled.connect(lambda on, n=name: on and self.set_tool(n))
+            self.group.addButton(b)
+            self.tool_buttons[name] = b
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        # ---------------- cut (the cut tool's own panel)
+        lay.addWidget(cut_panel)
+
+        # ---------------- sculpt
+        self.sculpt_box = QGroupBox(tr("sculpt_title"))
+        bl = QVBoxLayout(self.sculpt_box)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(tr("sculpt_size")))
+        self.size = QSlider(Qt.Horizontal)
+        self.size.setRange(2, 300)  # 0.2 .. 30 mm
+        self.size.valueChanged.connect(lambda v: self.sculpt.set_radius(v / 10.0))
+        row.addWidget(self.size, 1)
+        self.size_lbl = QLabel("")
+        self.size_lbl.setFixedWidth(60)
+        row.addWidget(self.size_lbl)
+        bl.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(tr("sculpt_strength")))
+        self.strength = QSlider(Qt.Horizontal)
+        self.strength.setRange(2, 100)
+        self.strength.valueChanged.connect(lambda v: self.sculpt.set_strength(v / 100.0))
+        row.addWidget(self.strength, 1)
+        self.strength_lbl = QLabel("")
+        self.strength_lbl.setFixedWidth(60)
+        row.addWidget(self.strength_lbl)
+        bl.addLayout(row)
+        self.sculpt_help = QLabel("")
+        self.sculpt_help.setWordWrap(True)
+        self.sculpt_help.setStyleSheet("color: gray; font-size: 11px;")
+        bl.addWidget(self.sculpt_help)
+        lay.addWidget(self.sculpt_box)
 
         # ---------------- holes
         rep = QGroupBox(tr("repair_title"))
@@ -281,52 +487,51 @@ class RepairPanel(QWidget):
         rl.addWidget(b)
         self.hole_max.valueChanged.connect(lambda _v: self.refresh())
         lay.addWidget(rep)
-
-        # ---------------- sculpt
-        box = QGroupBox(tr("sculpt_title"))
-        bl = QVBoxLayout(box)
-        self.group = QButtonGroup(self)
-        self.mode_buttons = {}
-        for mode, key in ((ADD, "sculpt_add"), (REMOVE, "sculpt_remove"), (SMOOTH, "sculpt_smooth")):
-            rb = QRadioButton(tr(key))
-            self.group.addButton(rb)
-            self.mode_buttons[mode] = rb
-            rb.toggled.connect(lambda on, m=mode: on and setattr(self.sculpt, "mode", m))
-            bl.addWidget(rb)
-        self.mode_buttons[sculpt.mode].setChecked(True)
-        row = QHBoxLayout()
-        row.addWidget(QLabel(tr("sculpt_size")))
-        self.size = QSlider(Qt.Horizontal)
-        self.size.setRange(2, 300)  # 0.2 .. 30 mm
-        self.size.valueChanged.connect(lambda v: self.sculpt.set_radius(v / 10.0))
-        row.addWidget(self.size, 1)
-        self.size_lbl = QLabel("")
-        self.size_lbl.setFixedWidth(60)
-        row.addWidget(self.size_lbl)
-        bl.addLayout(row)
-        row = QHBoxLayout()
-        row.addWidget(QLabel(tr("sculpt_strength")))
-        self.strength = QSlider(Qt.Horizontal)
-        self.strength.setRange(2, 100)
-        self.strength.valueChanged.connect(lambda v: self.sculpt.set_strength(v / 100.0))
-        row.addWidget(self.strength, 1)
-        self.strength_lbl = QLabel("")
-        self.strength_lbl.setFixedWidth(60)
-        row.addWidget(self.strength_lbl)
-        bl.addLayout(row)
-        help_lbl = QLabel(tr("sculpt_help"))
-        help_lbl.setWordWrap(True)
-        help_lbl.setStyleSheet("color: gray; font-size: 11px;")
-        bl.addWidget(help_lbl)
-        lay.addWidget(box)
         self.result_lbl = QLabel("")
         self.result_lbl.setWordWrap(True)
         lay.addWidget(self.result_lbl)
         lay.addStretch(1)
+        self.tool_buttons["cut"].setChecked(True)
+        self._show_sections()
         self.sync()
 
+    # ------------------------------------------------------------ tool switching
+    def set_active(self, on):
+        self.active = on
+        if on:
+            self._activate_tool()
+        else:
+            self.cut.deactivate() if self.cut.active else None
+            self.sculpt.deactivate()
+
+    def set_tool(self, name):
+        self.tool = name
+        if self.tool_buttons[name].isChecked() is False:
+            self.tool_buttons[name].setChecked(True)
+            return
+        self._show_sections()
+        if self.active:
+            self._activate_tool()
+
+    def _activate_tool(self):
+        if self.tool == "cut":
+            self.sculpt.deactivate()
+            if not self.cut.active:
+                self.cut.activate()
+        else:
+            if self.cut.active:
+                self.cut.deactivate()
+            self.sculpt.activate(self.tool)
+        self.on_change()
+
+    def _show_sections(self):
+        cut = self.tool == "cut"
+        self.cut_panel.setVisible(cut)
+        self.sculpt_box.setVisible(not cut)
+        self.sculpt_help.setText(tr("sculpt_help_build" if self.tool == BUILD else "sculpt_help_smooth"))
+
+    # ------------------------------------------------------------ display
     def sync(self):
-        """Show the tool's size / strength (they also change with Shift / Ctrl + wheel)."""
         for slider, value in ((self.size, int(round(self.sculpt.radius * 10))),
                               (self.strength, int(round(self.sculpt.strength * 100)))):
             if slider.value() != value:
@@ -338,6 +543,7 @@ class RepairPanel(QWidget):
 
     def refresh(self):
         self.sync()
+        self.cut_panel.refresh()
         models = self.get_models()
         if not models:
             self.model_lbl.setText(tr("select_model_first"))
@@ -381,3 +587,4 @@ class RepairPanel(QWidget):
         self.status(tr("repair_done", n=total))
         self.on_change()
         self.refresh()
+

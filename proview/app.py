@@ -89,15 +89,15 @@ class MainWindow(QMainWindow):
         self.tools_dock.setObjectName("tools")
         self.tools_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         self.stack = QStackedWidget()
-        self.cut_panel = CutPanel(self.cut)
+        self.cut_panel = CutPanel(self.cut)  # shown inside the Repair tab
         self.align_panel = AlignPanel(self.align, lambda: list(self.viewer.models))
-        self.stack.addWidget(self.cut_panel)
         self.stack.addWidget(self.align_panel)
         self.section_panel = SectionPanel(self.section, lambda: list(self.viewer.models))
         self.stack.addWidget(self.section_panel)
         self.orient_panel = OrientPanel(self.orient)
         self.stack.addWidget(self.orient_panel)
-        self.repair_panel = RepairPanel(self.sculpt, lambda: self._selected_models(), self.push_undo,
+        self.repair_panel = RepairPanel(self.sculpt, self.cut, self.cut_panel, lambda: self._selected_models(),
+                                        self.push_undo,
                                         lambda: self._tools_changed(),
                                         lambda text: self.statusBar().showMessage(text), settings=self.settings)
         self.stack.addWidget(self.repair_panel)
@@ -167,7 +167,7 @@ class MainWindow(QMainWindow):
         a_par = self._act(tr("parallel"), self.viewer.set_parallel, checkable=True)
         mv.addAction(a_par)
 
-        self.a_cut = self._act(tr("tool_cut"), self._toggle_cut, "X", checkable=True, icon_name="cut")
+        self.a_cut = self._act(tr("tool_cut"), lambda: self.open_repair("cut"), "X", icon_name="cut")
         self.a_align = self._act(tr("tool_align"), self._toggle_align, "A", checkable=True, icon_name="align")
         a_merge = self._act(tr("merge"), self.merge_models, "M", icon_name="merge")
         self.a_orient = self._act(tr("tool_orient"), self._toggle_orient, "O", checkable=True, icon_name="orient")
@@ -178,7 +178,6 @@ class MainWindow(QMainWindow):
                                    icon_name="section")
         grp = QActionGroup(self)
         grp.setExclusionPolicy(QActionGroup.ExclusionPolicy.ExclusiveOptional)
-        grp.addAction(self.a_cut)
         grp.addAction(self.a_align)
         grp.addAction(self.a_section)
         grp.addAction(self.a_orient)
@@ -208,7 +207,7 @@ class MainWindow(QMainWindow):
             tb.addAction(a)
         tb.addWidget(self._spacer())
         tiles = [
-            (self.a_cut, tr("tile_cut")), (self.a_align, tr("tile_align")),
+            (self.a_align, tr("tile_align")),
             (self.a_section, tr("tile_section")), (self.a_orient, tr("tile_orient")),
             (self.a_repair, tr("tile_repair")),
             (self.a_builder, tr("tile_builder")), (self.a_survey, tr("tile_survey")),
@@ -512,18 +511,6 @@ class MainWindow(QMainWindow):
         self._tools_changed()
 
     # ============================================================= tools
-    def _toggle_cut(self, on):
-        if on:
-            self.align.stop_picking()
-            self.stack.setCurrentWidget(self.cut_panel)
-            self.tools_dock.setWindowTitle(tr("cut_title"))
-            self.tools_dock.show()
-            self.cut.activate()
-        else:
-            self.cut.deactivate()
-            if not self._any_panel_tool():
-                self.tools_dock.hide()
-
     def _toggle_align(self, on):
         if on:
             self.stack.setCurrentWidget(self.align_panel)
@@ -556,12 +543,18 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.repair_panel)
             self.tools_dock.setWindowTitle(tr("repair_tab"))
             self.tools_dock.show()
-            self.sculpt.activate()
+            self.repair_panel.set_active(True)
             self.repair_panel.refresh()
         else:
-            self.sculpt.deactivate()
+            self.repair_panel.set_active(False)
             if not self._any_panel_tool():
                 self.tools_dock.hide()
+
+    def open_repair(self, tool="cut"):
+        """Open the Repair tab with a given tool (cut / build / smooth)."""
+        self.repair_panel.set_tool(tool)
+        if not self.a_repair.isChecked():
+            self.a_repair.setChecked(True)
 
     def _sculpt_changed(self):
         if hasattr(self, "repair_panel"):
@@ -598,7 +591,7 @@ class MainWindow(QMainWindow):
                 self.tools_dock.hide()
 
     def _any_panel_tool(self):
-        return any(a.isChecked() for a in (self.a_cut, self.a_align, self.a_section, self.a_orient,
+        return any(a.isChecked() for a in (self.a_align, self.a_section, self.a_orient,
                                            self.a_builder, self.a_survey, self.a_repair))
 
     def _toggle_builder(self, on):

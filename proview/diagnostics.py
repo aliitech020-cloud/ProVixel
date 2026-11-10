@@ -110,9 +110,9 @@ def run_selftest(win, app, out_png: str) -> None:
             win.viewer.set_view(name, animate=False)
         win.viewer.cube.hover(0, 0)
         log("selftest: views ok")
-        win.a_cut.setChecked(True)
+        win.open_repair("cut")
         win.cut._prepare(win.viewer.models[0])
-        win.a_cut.setChecked(False)
+        win.a_repair.setChecked(False)
         log("selftest: cut prepare ok")
         win.a_section.setChecked(True)
         w, h = win.viewer.rw.GetSize()
@@ -159,17 +159,16 @@ def run_selftest(win, app, out_png: str) -> None:
         log("selftest: model builder ok")
         m0 = win.viewer.models[0]
         win.model_list.setCurrentRow(0)
-        win.a_cut.setChecked(True)
+        win.open_repair("cut")
         cpt = project_center(win.viewer, m0)
         win.cut.select_island(m0, cpt[0], cpt[1])
         win.cut.clear()
-        win.a_cut.setChecked(False)
-        win.a_repair.setChecked(True)
-        for mode in ("add", "remove", "smooth"):
-            win.sculpt.mode = mode
-            if win.sculpt.on_press(cpt[0], cpt[1], False, False, 0):
-                win.sculpt.on_move(cpt[0] + 4, cpt[1] + 3, False, False)
-                win.sculpt.on_release(cpt[0] + 4, cpt[1] + 3, False, False)
+        for tool, shift in (("build", False), ("build", True), ("smooth", False), ("smooth", True)):
+            win.open_repair(tool)
+            win.sculpt.on_move(cpt[0], cpt[1], False, shift)
+            if win.sculpt.on_press(cpt[0], cpt[1], False, shift, 0):
+                win.sculpt.on_move(cpt[0] + 4, cpt[1] + 3, False, shift)
+                win.sculpt.on_release(cpt[0] + 4, cpt[1] + 3, False, shift)
         win.sculpt.on_wheel_mod(1, False, True)
         win.sculpt.on_wheel_mod(1, True, False)
         win.undo()
