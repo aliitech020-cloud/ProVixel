@@ -60,6 +60,7 @@ class Model:
         self.matrix = np.eye(4)
         self.visible = True
         self.opacity = 1.0
+        self.dirty = False  # changed since it was opened / last saved
 
         self.mapper = vtkPolyDataMapper()
         self.mapper.SetColorModeToDirectScalars()

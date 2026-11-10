@@ -22,9 +22,8 @@ from scipy.sparse import coo_matrix, diags
 from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
 from vtkmodules.vtkCommonTransforms import vtkTransform
-from vtkmodules.vtkFiltersCore import vtkTubeFilter
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
-from vtkmodules.vtkFiltersSources import vtkArrowSource, vtkDiskSource
+from vtkmodules.vtkFiltersSources import vtkArrowSource
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
 
 from .i18n import tr
@@ -33,6 +32,7 @@ from .mesh import Mesh, transform_points
 from .model import numpy_to_vtk_matrix
 from .model_builder import boundary_loops, rotation_to_z
 from .repair import fill_holes, loop_size, vertex_adjacency
+from .section import iso_segments
 from .selection import pick_mesh
 
 BUILD, SMOOTH = "build", "smooth"
@@ -44,34 +44,21 @@ COLOR_SMOOTH_STRONG = (0.62, 0.45, 1.00)
 
 
 class BrushCursor:
-    """3D brush on the surface: a ring + translucent disc lying on the surface (size),
-    the disc's opacity shows the strength, and an arrow shows what the brush does."""
+    """Brush drawn on the surface itself: the brush edge follows the surface (where the
+    surface meets the brush sphere), the brushed area is tinted (more = stronger) and an
+    arrow shows what the brush does."""
 
     def __init__(self, renderer):
         self.ren = renderer
-        # unit ring in the XY plane
-        t = np.linspace(0, 2 * np.pi, 72, endpoint=False)
-        pts = vtkPoints()
-        for a in t:
-            pts.InsertNextPoint(np.cos(a), np.sin(a), 0.0)
-        lines = vtkCellArray()
-        lines.InsertNextCell(len(t) + 1)
-        for i in range(len(t)):
-            lines.InsertCellPoint(i)
-        lines.InsertCellPoint(0)
-        pd = vtkPolyData()
-        pd.SetPoints(pts)
-        pd.SetLines(lines)
-        tube = vtkTubeFilter()
-        tube.SetInputData(pd)
-        tube.SetRadius(0.035)
-        tube.SetNumberOfSides(8)
-        self.ring = self._actor(tube)
-        disk = vtkDiskSource()
-        disk.SetInnerRadius(0.0)
-        disk.SetOuterRadius(1.0)
-        disk.SetCircumferentialResolution(48)
-        self.disc = self._actor(disk)
+        self.ring_pd = vtkPolyData()
+        self.tint_pd = vtkPolyData()
+        self.ring = self._actor(self.ring_pd, lines=True)
+        self.tint = self._actor(self.tint_pd)
+        rp = self.ring.GetProperty()
+        rp.SetLineWidth(3.0)
+        rp.SetLighting(False)
+        rp.SetRenderLinesAsTubes(True)
+        self.tint.GetProperty().SetLighting(False)
         # unit arrow along +Z, starting at the origin
         arrow = vtkArrowSource()
         arrow.SetShaftRadius(0.06)
@@ -82,58 +69,85 @@ class BrushCursor:
         f = vtkTransformPolyDataFilter()
         f.SetInputConnection(arrow.GetOutputPort())
         f.SetTransform(tr_)
-        self.arrow = self._actor(f)
-        for a in (self.ring, self.disc, self.arrow):
-            a.GetProperty().SetLighting(False)
-        self.ring.GetProperty().SetLighting(True)
-        self.arrow.GetProperty().SetLighting(True)
+        f.Update()
+        self.arrow = self._actor(f.GetOutput())
         self.shown = False
 
     @staticmethod
-    def _actor(src):
+    def _actor(pd, lines=False):
         m = vtkPolyDataMapper()
-        m.SetInputConnection(src.GetOutputPort())
+        m.SetInputData(pd)
+        m.ScalarVisibilityOff()
         m.SetResolveCoincidentTopologyToPolygonOffset()
+        if lines:
+            m.SetRelativeCoincidentTopologyLineOffsetParameters(-4, -4)
+        else:
+            m.SetRelativeCoincidentTopologyPolygonOffsetParameters(-3, -3)
         a = vtkActor()
         a.SetMapper(m)
         a.PickableOff()
         return a
 
-    def place(self, center, normal, radius, strength, color, arrow_sign):
+    def place(self, center, normal, radius, strength, color, arrow_sign, lv=None, lf=None):
+        """``lv``/``lf``: world vertices and faces of the surface around the brush."""
         n = np.asarray(normal, float)
         n = n / (np.linalg.norm(n) or 1.0)
-        Rn = rotation_to_z(n).T  # maps +Z onto the normal
-        M = np.eye(4)
-        M[:3, :3] = Rn * radius
-        M[:3, 3] = np.asarray(center) + n * 0.03 * radius
-        self.ring.SetUserMatrix(numpy_to_vtk_matrix(M))
-        self.disc.SetUserMatrix(numpy_to_vtk_matrix(M))
-        # arrow: out of the surface (build up), into it (carve) or flat on it (smooth)
-        A = np.eye(4)
+        center = np.asarray(center, float)
+        lift = n * min(0.02, 0.01 * radius)
+        if lv is not None and len(lf):
+            d = np.linalg.norm(lv - center, axis=1)
+            segs = iso_segments(lv, lf, d - radius) + lift
+            self._set_lines(segs)
+            inside = (d[lf] < radius).any(1)
+            self._set_tris(lv + lift, lf[inside])
+        # arrow: out of the surface (build up) or into it (carve); none for smoothing
         if arrow_sign == 0:
-            A[:3, :3] = Rn * radius * 0.45
-            A[:3, 3] = np.asarray(center) + n * 0.1 * radius
             self.arrow.SetVisibility(False)
         else:
             Ra = rotation_to_z(n * arrow_sign).T
+            A = np.eye(4)
             A[:3, :3] = Ra * radius * 0.9
-            start = np.asarray(center) + (n * radius * 0.95 if arrow_sign < 0 else n * 0.05 * radius)
-            A[:3, 3] = start
+            A[:3, 3] = center + (n * radius * 0.95 if arrow_sign < 0 else n * 0.05 * radius)
+            self.arrow.SetUserMatrix(numpy_to_vtk_matrix(A))
             self.arrow.SetVisibility(True)
-        self.arrow.SetUserMatrix(numpy_to_vtk_matrix(A))
-        for a in (self.ring, self.arrow):
-            a.GetProperty().SetColor(*color)
-        dp = self.disc.GetProperty()
-        dp.SetColor(*color)
-        dp.SetOpacity(0.10 + 0.35 * float(strength))
+            self.arrow.GetProperty().SetColor(*color)
+        self.ring.GetProperty().SetColor(*color)
+        tp = self.tint.GetProperty()
+        tp.SetColor(*color)
+        tp.SetOpacity(0.18 + 0.4 * float(strength))
         if not self.shown:
-            for a in (self.disc, self.ring, self.arrow):
+            for a in (self.tint, self.ring, self.arrow):
                 self.ren.AddActor(a)
             self.shown = True
 
+    def _set_lines(self, segs):
+        from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+
+        k = len(segs)
+        pts = vtkPoints()
+        pts.SetData(numpy_to_vtk(np.ascontiguousarray(segs.reshape(-1, 3)), deep=True))
+        cells = vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(np.arange(0, 2 * k + 1, 2, dtype=np.int64), deep=True),
+                      numpy_to_vtkIdTypeArray(np.arange(2 * k, dtype=np.int64), deep=True))
+        self.ring_pd.SetPoints(pts)
+        self.ring_pd.SetLines(cells)
+        self.ring_pd.Modified()
+
+    def _set_tris(self, v, f):
+        from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+
+        pts = vtkPoints()
+        pts.SetData(numpy_to_vtk(np.ascontiguousarray(v), deep=True))
+        cells = vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(np.arange(0, 3 * len(f) + 1, 3, dtype=np.int64), deep=True),
+                      numpy_to_vtkIdTypeArray(np.ascontiguousarray(f.ravel(), dtype=np.int64), deep=True))
+        self.tint_pd.SetPoints(pts)
+        self.tint_pd.SetPolys(cells)
+        self.tint_pd.Modified()
+
     def hide(self):
         if self.shown:
-            for a in (self.disc, self.ring, self.arrow):
+            for a in (self.tint, self.ring, self.arrow):
                 self.ren.RemoveActor(a)
             self.shown = False
 
@@ -167,6 +181,8 @@ class SculptTool:
             self.mode = mode
         self.active = True
         self.viewer.style.tool = self
+        if all(m.opacity >= 0.999 for m in self.viewer.models):
+            self.viewer.ren.SetUseDepthPeeling(0)  # much faster; the brush tint blends fine without it
         self.viewer.render()
 
     def deactivate(self):
@@ -177,6 +193,7 @@ class SculptTool:
         self.cursor.hide()
         self._topo = {}
         self._local = None
+        self.viewer.ren.SetUseDepthPeeling(1)
         self.viewer.render()
 
     def set_radius(self, r):
@@ -197,9 +214,7 @@ class SculptTool:
 
     def _refresh_cursor(self):
         if self._last_hit is not None and self.active:
-            c, n = self._last_hit
-            color, sign = self._style(self._shift)
-            self.cursor.place(c, n, self.radius, self.strength, color, sign)
+            self._show(self._last_hit, self._shift)
             self.viewer.render()
 
     # ------------------------------------------------------------ helpers
@@ -283,11 +298,18 @@ class SculptTool:
         if res is None:
             return None
         c, nrm = res
-        d2 = np.einsum("ij,ij->i", wv - c, wv - c)
-        idx = np.nonzero(d2 < self.radius ** 2)[0]
+        loc = self._local
+        if loc is None or np.linalg.norm(c - loc["center"]) > loc["reach"] - self.radius:
+            self._recentre(c)
+            loc = self._local
+        cand = loc["vidx"]  # only vertices near the brush (the patch covers 2.5 x the radius)
+        dv = wv[cand] - c
+        d2c = np.einsum("ij,ij->i", dv, dv)
+        inside = d2c < self.radius ** 2
+        idx = cand[inside]
         if len(idx) == 0:
             return c, nrm
-        fall = (1.0 - d2[idx] / self.radius ** 2) ** 2
+        fall = (1.0 - d2c[inside] / self.radius ** 2) ** 2
         topo = s["topo"]
         inc = topo["inc"]
         if self.mode == SMOOTH:
@@ -318,6 +340,22 @@ class SculptTool:
             nrm = an / np.linalg.norm(an)
         return c, nrm
 
+    def _patch(self):
+        """World vertices / faces of the surface around the last hit (for drawing the brush)."""
+        loc = self._local
+        if loc is None:
+            return None, None
+        if self._s is not None:
+            wv = self._s["wv"]
+        else:
+            m = self.get_model()
+            if m is None:
+                return None, None
+            wv = m.world_geometry()[0]
+        if len(loc["vidx"]) and loc["vidx"].max() >= len(wv):
+            return None, None
+        return wv[loc["vidx"]], loc["faces"]
+
     def _show(self, res, shift):
         self._shift = shift
         if res is None:
@@ -326,7 +364,25 @@ class SculptTool:
             return
         self._last_hit = res
         color, sign = self._style(shift)
-        self.cursor.place(res[0], res[1], self.radius, self.strength, color, sign)
+        # the patch must cover the brush: re-centre it when the brush grew or moved away
+        loc = self._local
+        if loc is None or np.linalg.norm(res[0] - loc["center"]) > loc["reach"] - self.radius:
+            self._recentre(res[0])
+        lv, lf = self._patch()
+        self.cursor.place(res[0], res[1], self.radius, self.strength, color, sign, lv, lf)
+
+    def _recentre(self, c):
+        m = self._s["model"] if self._s is not None else self.get_model()
+        if m is None:
+            return
+        wv = self._s["wv"] if self._s is not None else m.world_geometry()[0]
+        faces = m.mesh.faces
+        reach = max(2.5 * self.radius, 2.0)
+        near_v = np.einsum("ij,ij->i", wv - c, wv - c) < reach ** 2
+        sub = faces[near_v[faces[:, 0]] | near_v[faces[:, 1]] | near_v[faces[:, 2]]]
+        vidx, inv = np.unique(sub.ravel(), return_inverse=True)
+        self._local = {"faces_id": id(faces), "vidx": vidx, "faces": inv.reshape(-1, 3), "center": c,
+                       "reach": reach}
 
     # ------------------------------------------------------------ events
     def on_press(self, x, y, ctrl, shift, repeat):

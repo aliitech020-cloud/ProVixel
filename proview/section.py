@@ -14,7 +14,14 @@ def plane_section(vertices: np.ndarray, faces: np.ndarray, origin, normal) -> np
     normal = normal / (np.linalg.norm(normal) or 1.0)
     if len(faces) == 0:
         return np.zeros((0, 2, 3))
-    d = (vertices - origin) @ normal
+    return iso_segments(vertices, faces, (vertices - origin) @ normal)
+
+
+def iso_segments(vertices: np.ndarray, faces: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Line segments (k, 2, 3) where a per-vertex scalar crosses zero on a triangle mesh."""
+    if len(faces) == 0:
+        return np.zeros((0, 2, 3))
+    d = np.asarray(values, float)
     # nudge vertices lying exactly on the plane so every crossing edge is well defined
     d = np.where(d == 0.0, 1e-12, d)
     fd = d[faces]  # (m, 3)

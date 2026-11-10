@@ -356,8 +356,10 @@ class MainWindow(QMainWindow):
         for m in parts:
             m.set_visible(False)
         first = parts[0]
-        self._add_model(Model(name, mesh, color=None if first.material in MATERIALS else first.color,
-                              material=first.material if first.material in MATERIALS else None))
+        merged = Model(name, mesh, color=None if first.material in MATERIALS else first.color,
+                       material=first.material if first.material in MATERIALS else None)
+        merged.dirty = True
+        self._add_model(merged)
         self.panel.refresh_rows()
         self._models_changed()
         self.statusBar().showMessage(tr("merge_done", n=len(parts), faces=mesh.n_faces))
@@ -461,7 +463,9 @@ class MainWindow(QMainWindow):
         path = self._ask_save_path(m.name, m.has_colors)
         if path:
             save_mesh(path, m.mesh, m.matrix)
+            m.dirty = False
             self.statusBar().showMessage(tr("saved", path=path))
+        return bool(path)
 
     def save_merged(self):
         visible = [m for m in self.viewer.models if m.visible]
@@ -470,10 +474,13 @@ class MainWindow(QMainWindow):
         path = self._ask_save_path("merged", any(m.has_colors for m in visible))
         if path:
             save_mesh(path, merge_meshes([m.mesh.transformed(m.matrix) for m in visible], [m.color for m in visible]))
+            for m in visible:
+                m.dirty = False
             self.statusBar().showMessage(tr("saved", path=path))
 
     # ============================================================== undo
     def push_undo(self, model: Model):
+        model.dirty = True
         self.undo_stack.append((model, model.mesh, model.matrix.copy(), None, model.selection.copy()))
         self._trim_undo()
 
@@ -624,7 +631,9 @@ class MainWindow(QMainWindow):
     def _add_built(self, source, mesh, part=None, first=True):
         source.set_visible(False)
         suffix = f" - model {part}" if part else " - model"
-        self._add_model(Model(f"{source.name}{suffix}", mesh, material="Stone - Yellow"))
+        built = Model(f"{source.name}{suffix}", mesh, material="Stone - Yellow")
+        built.dirty = True
+        self._add_model(built)
         # select just the new model(s): pressing Create again must not rebuild from the results
         if first:
             self.model_list.clearSelection()
@@ -699,7 +708,33 @@ class MainWindow(QMainWindow):
         if paths:
             self.open_files(paths)
 
+    def _confirm_unsaved(self) -> bool:
+        """Ask before closing when models were changed and not saved. False = stay open."""
+        dirty = [m for m in self.viewer.models if m.dirty]
+        if not dirty:
+            return True
+        names = "\n".join("  \u2022 " + m.name for m in dirty[:12]) + ("\n  ..." if len(dirty) > 12 else "")
+        box = QMessageBox(QMessageBox.Warning, tr("unsaved_title"), tr("unsaved_msg", names=names),
+                          QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, self)
+        box.setDefaultButton(QMessageBox.Save)
+        answer = box.exec()
+        if answer == QMessageBox.Discard:
+            return True
+        if answer != QMessageBox.Save:
+            return False
+        for m in dirty:
+            path = self._ask_save_path(m.name, m.has_colors)
+            if not path:
+                return False  # save dialog cancelled: keep the program open
+            save_mesh(path, m.mesh, m.matrix)
+            m.dirty = False
+            self._last_dir = os.path.dirname(path)
+        return True
+
     def closeEvent(self, ev):
+        if not self._confirm_unsaved():
+            ev.ignore()
+            return
         self.panel.close()
         self.view_bar.close()
         self.viewer.Finalize()
