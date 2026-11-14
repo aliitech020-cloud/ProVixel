@@ -342,10 +342,35 @@ def test_fuse_joins_overlapping_scans():
         for i in range(40):
             p, q = k * 40 + i, k * 40 + (i + 1) % 40
             f += [(p, q, p + 40), (q, q + 40, p + 40)]
-    ins = Mesh(v, np.array(f)[:, ::-1])  # stored the other way round on purpose
+    ins = Mesh(v, np.array(f)[:, ::-1])  # facing up like the base
     out, joined = fuse_meshes([base, ins], gap=1.0)
     assert joined == 1
     assert out.connected_components()[0] == 1
     e = np.concatenate([out.faces[:, [0, 1]], out.faces[:, [1, 2]], out.faces[:, [2, 0]]])
     assert len(np.unique(e, axis=0)) == len(e)  # consistently oriented, no edge used twice the same way
     assert len(boundary_loops(out.faces)) == 2  # outer edge of the base + inner edge of the ring
+
+
+def test_fuse_leaves_far_edges_open():
+    """Where the edges of two scans part, no long bridging triangles are made."""
+    from scipy.spatial import Delaunay
+
+    from proview.fuse import fuse_meshes
+
+    g = np.arange(-10, 10.01, 0.5)
+    X, Y = np.meshgrid(g, g)
+    pts = np.stack([X.ravel(), Y.ravel()], 1)
+    tri = Delaunay(pts).simplices
+    base = Mesh(np.c_[pts, np.zeros(len(pts))], tri)
+    base = Mesh(base.vertices, np.where((base.face_normals()[:, 2] < 0)[:, None], tri[:, ::-1], tri))
+    # a patch lying on the base for x < 6, then bending far away from it
+    X, Y = np.meshgrid(np.arange(2, 20.01, 0.4), np.arange(-3, 3.01, 0.4))
+    Z = 0.05 + np.where(X > 6, (X - 6) ** 1.5, 0)
+    v = np.stack([X.ravel(), Y.ravel(), Z.ravel()], 1)
+    nx = X.shape[1]
+    f = [(q, q + 1, q + nx) for r in range(X.shape[0] - 1) for c in range(nx - 1) for q in [r * nx + c]]
+    f += [(q + 1, q + nx + 1, q + nx) for r in range(X.shape[0] - 1) for c in range(nx - 1) for q in [r * nx + c]]
+    out, joined = fuse_meshes([base, Mesh(v, np.array(f))], gap=1.0)
+    assert joined == 1
+    t = out.vertices[out.faces]
+    assert np.linalg.norm(t - np.roll(t, 1, axis=1), axis=2).max() < 4.0

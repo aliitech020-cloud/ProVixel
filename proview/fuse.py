@@ -90,7 +90,8 @@ def _runs(mask: np.ndarray, closed: bool) -> list[tuple[int, int]]:
     return out
 
 
-def fuse_pair(base: Mesh, insert: Mesh, gap: float = 1.0, progress=lambda text: None) -> tuple[Mesh, int]:
+def fuse_pair(base: Mesh, insert: Mesh, gap: float = 1.0, progress=lambda text: None,
+              region=None) -> tuple[Mesh, int]:
     """Fuse ``insert`` into ``base`` (both in the same space). Returns (mesh, joined edge length in
     vertices; 0 means the scans did not meet and were only combined)."""
     if base.n_faces == 0 or insert.n_faces == 0:
@@ -120,10 +121,10 @@ def fuse_pair(base: Mesh, insert: Mesh, gap: float = 1.0, progress=lambda text: 
 
     progress("Joining the edges")
     ins = insert
-    joined, extra_faces = _join(trimmed, ins, gap)
+    joined, extra_faces = _join(trimmed, ins, gap, region)
     if joined == -1:  # the insert is stored the other way round: turn it and try again
         ins = Mesh(insert.vertices, insert.faces[:, ::-1], insert.colors)
-        joined, extra_faces = _join(trimmed, ins, gap)
+        joined, extra_faces = _join(trimmed, ins, gap, region)
         if joined == -1:
             joined, extra_faces = 0, []
     out = merge_meshes([trimmed, ins])
@@ -137,9 +138,24 @@ def fuse_pair(base: Mesh, insert: Mesh, gap: float = 1.0, progress=lambda text: 
     return out, joined
 
 
-def _join(a: Mesh, b: Mesh, gap: float):
+def _short_faces(faces, allv, limit: float) -> list:
+    """The triangles of a joining strip that bridge at most ``limit``; longer ones (where the
+    edges part) are left out, so the scans stay open there."""
+    if not faces:
+        return []
+    t = allv[np.asarray(faces)]
+    edges = np.linalg.norm(t - np.roll(t, 1, axis=1), axis=2)
+    keep = edges.max(1) <= limit
+    return [f for f, k in zip(faces, keep) if k]
+
+
+def _join(a: Mesh, b: Mesh, gap: float, region=None):
     """Zipper faces between facing open edges of a and b (b's vertex ids offset by a.n_vertices).
-    Returns (number of joined b edge vertices, faces) or (-1, []) when b is oriented against a."""
+
+    Only edge stretches that run side by side within the gap are joined; a stretch whose strip
+    would contain a long triangle is left open. ``region`` (points) limits joining to edges near
+    those points (the user's brush selection). Returns (number of joined b edge vertices, faces),
+    or (-1, []) when b is oriented against a."""
     a_loops = boundary_loops(a.faces)
     b_loops = boundary_loops(b.faces)
     if not a_loops or not b_loops:
@@ -148,60 +164,75 @@ def _join(a: Mesh, b: Mesh, gap: float):
     a_ids = np.concatenate([np.asarray(lp) for lp in a_loops])
     a_loop_of = np.concatenate([np.full(len(lp), k) for k, lp in enumerate(a_loops)])
     a_pos = np.concatenate([np.arange(len(lp)) for lp in a_loops])
-    a_tree = cKDTree(av[a_ids])
     reach = gap + TRIM + 0.3
+    a_ok = np.ones(len(a_ids), bool)
+    region_tree = cKDTree(region) if region is not None and len(region) else None
+    if region_tree is not None:
+        a_ok = region_tree.query(av[a_ids], distance_upper_bound=1.0)[0] < np.inf
+    if not a_ok.any():
+        return 0, []
+    sel = np.flatnonzero(a_ok)
+    a_tree = cKDTree(av[a_ids[sel]])
     off = a.n_vertices
+    allv = np.vstack([av, bv])
+    limit = 2.0 * reach + 0.5
     faces: list = []
     joined = 0
     votes_same = votes_other = 0
     plans = []
     for blp in b_loops:
         Q = np.asarray(blp)[::-1]  # reversed: runs the same way round as a's facing edge
-        dq, nq = a_tree.query(bv[Q], distance_upper_bound=reach)
+        dq, k = a_tree.query(bv[Q], distance_upper_bound=reach)
         ok = np.isfinite(dq)
+        if region_tree is not None:
+            ok &= region_tree.query(bv[Q], distance_upper_bound=1.0)[0] < np.inf
         if ok.sum() < 3:
             continue
+        nq = sel[np.minimum(k, len(sel) - 1)]
         loop_id = np.bincount(a_loop_of[nq[ok]]).argmax()
-        ok &= np.isfinite(dq) & (a_loop_of[np.minimum(nq, len(a_ids) - 1)] == loop_id)
+        ok &= a_loop_of[nq] == loop_id
         P_full = np.asarray(a_loops[loop_id])
-        pos = a_pos[np.minimum(nq, len(a_ids) - 1)]
-        # orientation check: along matched b points, a's matching positions should move forward
-        steps = np.diff(pos[ok]) % len(P_full)
-        fwd = np.sum((steps > 0) & (steps < len(P_full) / 2))
-        bwd = np.sum(steps > len(P_full) / 2)
-        votes_same += fwd
-        votes_other += bwd
+        pos = a_pos[nq]
+        n_a = len(P_full)
+        steps = (np.diff(pos[ok]) + n_a // 2) % n_a - n_a // 2  # signed step along a's loop
+        near = np.abs(steps) <= max(2, n_a // 8)
+        votes_same += np.sum(near & (steps > 0))
+        votes_other += np.sum(near & (steps < 0))
         plans.append((Q, ok, P_full, pos))
     if votes_other > votes_same:
         return -1, []
     for Q, ok, P_full, pos in plans:
         n = len(P_full)
-        closed = ok.mean() > 0.9
-        if closed:
-            ok = np.ones(len(Q), bool)
-        for s, e in _runs(ok, closed):
-            if (s, e) == (-1, -1):  # whole loop: close the ring
-                k0 = int(np.argmin(np.linalg.norm(av[P_full] - bv[Q[0]], axis=1)))
-                P = np.roll(P_full, -k0)
-                P = np.append(P, P[0])
-                Qr = np.append(Q, Q[0])
-            else:
-                qi = np.arange(s, s + ((e - s) % len(Q)) + 1) % len(Q)
-                if len(qi) < 3:
+        if ok.all():  # the whole edge loop meets one edge loop of the other scan: close the ring
+            k0 = int(np.argmin(np.linalg.norm(av[P_full] - bv[Q[0]], axis=1)))
+            P = np.roll(P_full, -k0)
+            ring = _zipper(np.append(P, P[0]), np.append(Q, Q[0]) + off,
+                           av[np.append(P, P[0])], bv[np.append(Q, Q[0])])
+            short = _short_faces(ring, allv, limit)
+            if len(short) > 0.9 * len(ring):
+                faces += short
+                joined += len(Q)
+                continue
+        for s, e in _runs(ok, False):
+            qi = np.arange(s, s + ((e - s) % len(Q)) + 1) % len(Q)
+            # split where the matching point on a's edge jumps (the edges part and meet again)
+            p = pos[qi]
+            step = (np.diff(p) + n // 2) % n - n // 2  # signed step along a's loop
+            cuts = np.flatnonzero((step < -2) | (step > 20)) + 1
+            for part in np.split(qi, cuts):
+                if len(part) < 3:
                     continue
-                Qr = Q[qi]
-                p0, p1 = pos[qi[0]], pos[qi[-1]]
+                p0, p1 = pos[part[0]], pos[part[-1]]
                 span = (p1 - p0) % n
-                if span == 0 or span > n / 2:
+                if span == 0 or span > 4 * len(part) + 20:
                     continue
                 P = P_full[(p0 + np.arange(span + 1)) % n]
-            faces += [(f[0], f[1], f[2]) for f in _zipper_ids(P, Qr + off, av, bv, off)]
-            joined += len(Qr)
+                strip = _zipper(P, Q[part] + off, av[P], bv[Q[part]])
+                short = _short_faces(strip, allv, limit)
+                if len(short) >= 2:
+                    faces += short
+                    joined += len(part)
     return joined, faces
-
-
-def _zipper_ids(P, Q, av, bv, off):
-    return _zipper(P, Q, av[P], bv[Q - off])
 
 
 def _close_seam_notches(mesh: Mesh, n_a: int, gap: float) -> Mesh:
@@ -230,8 +261,9 @@ def _close_seam_notches(mesh: Mesh, n_a: int, gap: float) -> Mesh:
 
 
 def fuse_meshes(meshes: list[Mesh], gap: float = 1.0, progress=lambda text: None,
-                fallback_colors=None) -> tuple[Mesh, int]:
+                fallback_colors=None, region=None) -> tuple[Mesh, int]:
     """Fuse several aligned scans: the largest is the base, smaller ones are joined into it.
+    ``region``: points; when given, only open edges near them are joined.
     Returns (mesh, number of scans that were joined to the others)."""
     if fallback_colors is not None and any(m.colors is not None for m in meshes):
         meshes = [m if m.colors is not None else
@@ -243,6 +275,6 @@ def fuse_meshes(meshes: list[Mesh], gap: float = 1.0, progress=lambda text: None
     n_joined = 0
     for k, i in enumerate(order[1:], 1):
         prefix = f"{k}/{len(order) - 1}: " if len(order) > 2 else ""
-        out, joined = fuse_pair(out, meshes[i], gap, lambda t, p=prefix: progress(p + t))
+        out, joined = fuse_pair(out, meshes[i], gap, lambda t, p=prefix: progress(p + t), region)
         n_joined += joined > 0
     return out, n_joined

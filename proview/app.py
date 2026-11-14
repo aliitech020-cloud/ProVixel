@@ -350,11 +350,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("merge"), tr("merge_need"))
             return
         interactive = fuse is None
+        # faces painted with the Cut brush mark the edges to join
+        region = [m.mesh.transformed(m.matrix).vertices[np.unique(m.mesh.faces[m.selection])]
+                  for m in parts if len(m.selection) == m.mesh.n_faces and m.selection.any()]
+        region = np.vstack(region) if region else None
+        only_selected = region is not None
         if fuse is None:
-            choice = self._ask_merge_mode()
+            choice = self._ask_merge_mode(region is not None)
             if choice is None:
                 return
-            fuse, gap = choice
+            fuse, gap, only_selected = choice
         self.cut.cancel()
         self.align.stop_picking()
         for m in parts:
@@ -367,6 +372,7 @@ class MainWindow(QMainWindow):
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
                 mesh, joined = fuse_meshes(meshes, gap or 1.0, fallback_colors=[m.color for m in parts],
+                                           region=region if only_selected else None,
                                            progress=lambda t: (self.statusBar().showMessage(t),
                                                                QApplication.processEvents()))
             finally:
@@ -392,8 +398,8 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(tr("merge_done", n=len(parts), faces=mesh.n_faces))
 
-    def _ask_merge_mode(self):
-        """(fuse, gap) or None when cancelled. The choice is remembered."""
+    def _ask_merge_mode(self, has_selection=False):
+        """(fuse, gap, only selected edges) or None when cancelled. The choice is remembered."""
         from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel,
                                        QRadioButton, QVBoxLayout)
 
@@ -417,10 +423,21 @@ class MainWindow(QMainWindow):
         gap.setValue(float(self.settings.value("fuse_gap", 1.0)))
         form.addRow(tr("fuse_gap"), gap)
         lay.addLayout(form)
+        from PySide6.QtWidgets import QCheckBox
+
+        only_sel = QCheckBox(tr("fuse_only_selected"))
+        only_sel.setChecked(has_selection)
+        only_sel.setEnabled(has_selection)
+        lay.addWidget(only_sel)
+        hint = QLabel(tr("fuse_selection_hint"))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #9aa0a6;")
+        lay.addWidget(hint)
         fuse_on = str(self.settings.value("merge_fuse", "true")).lower() == "true"
         (r_fuse if fuse_on else r_combine).setChecked(True)
         gap.setEnabled(fuse_on)
-        r_fuse.toggled.connect(lambda on: gap.setEnabled(on))
+        only_sel.setEnabled(has_selection and fuse_on)
+        r_fuse.toggled.connect(lambda on: (gap.setEnabled(on), only_sel.setEnabled(on and has_selection)))
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(lambda: dlg.accept())
         buttons.rejected.connect(lambda: dlg.reject())
@@ -430,7 +447,7 @@ class MainWindow(QMainWindow):
             return None
         self.settings.setValue("merge_fuse", "true" if r_fuse.isChecked() else "false")
         self.settings.setValue("fuse_gap", gap.value())
-        return r_fuse.isChecked(), gap.value()
+        return r_fuse.isChecked(), gap.value(), only_sel.isChecked()
 
     def _model_selected(self, row):
         m = self.active_model()

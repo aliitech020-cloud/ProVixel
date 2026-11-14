@@ -245,6 +245,11 @@ _STRINGS = {
                         "triangles. No scanned point is moved.",
                         "يُحتفظ بالسكان الأصغر في منطقة التداخل وتُلحم الحواف المتقابلة."),
     "fuse_gap": ("Join gaps up to", "لحام الفراغات حتى"),
+    "fuse_only_selected": ("Only join the edges inside the brush selection", "لحام الحواف المحددة فقط"),
+    "fuse_selection_hint": ("Edges are joined only where they run side by side within the gap size. To "
+                            "choose which edges to join, paint over them with the Cut brush (Repair > "
+                            "Cut) on the models before pressing Merge.",
+                            "لاختيار الحواف: حددها بفرشاة القص قبل الدمج."),
     "fuse_done": ("Fused {n} models into one surface ({joined} joined, {faces:,} triangles). "
                   "The originals are hidden.", "تم لحام {n} نماذج ({faces:,} مثلث)."),
     "fuse_not_touching": ("Some models did not meet the others (their edges are farther apart than the "
