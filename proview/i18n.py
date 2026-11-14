@@ -238,6 +238,18 @@ _STRINGS = {
                     "نماذج ثلاثية الأبعاد (*.stl *.ply);;STL (*.stl);;PLY (*.ply);;كل الملفات (*)"),
     "save_filter": ("STL file (*.stl);;PLY file (*.ply)", "ملف STL (*.stl);;ملف PLY (*.ply)"),
     "merge": ("Merge", "دمج"),
+    "merge_combine": ("Combine only (keep the surfaces as they are)", "جمع فقط"),
+    "merge_fuse": ("Fuse into one connected surface (join the edges)", "دمج ولحام الحواف"),
+    "merge_fuse_info": ("Where the scans overlap, the smaller scan (e.g. the scan body) is kept and the "
+                        "larger one is cut away under it; the facing edges are then joined with new "
+                        "triangles. No scanned point is moved.",
+                        "يُحتفظ بالسكان الأصغر في منطقة التداخل وتُلحم الحواف المتقابلة."),
+    "fuse_gap": ("Join gaps up to", "لحام الفراغات حتى"),
+    "fuse_done": ("Fused {n} models into one surface ({joined} joined, {faces:,} triangles). "
+                  "The originals are hidden.", "تم لحام {n} نماذج ({faces:,} مثلث)."),
+    "fuse_not_touching": ("Some models did not meet the others (their edges are farther apart than the "
+                          "gap size), so they were only combined there. Align them first or raise "
+                          "\"Join gaps up to\".", "بعض النماذج لا تتلامس فلم تُلحم."),
     "merge_tip": ("Merge the selected models (Ctrl/Shift+click in the list) into one model.\n"
                   "If fewer than two are selected, all visible models are merged.\n"
                   "The original models are hidden, not deleted.",

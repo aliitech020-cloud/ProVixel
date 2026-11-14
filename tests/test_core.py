@@ -316,3 +316,36 @@ def test_undercut_depth_on_mushroom():
     assert abs(np.median(depth[stem]) - 2.0) < 0.3      # overhang is 5 - 3 = 2 mm
     # from the side everything on the far side / under the cap changes, top is now undercut partly
     assert (undercut_depth(v, f, [0, 0, -1], cell=0.1)[top] > 0).all()
+
+
+def test_fuse_joins_overlapping_scans():
+    """A scan with a hole and a smaller scan sitting in it become one connected, manifold surface."""
+    from scipy.spatial import Delaunay
+
+    from proview.fuse import fuse_meshes
+    from proview.model_builder import boundary_loops
+
+    g = np.arange(-10, 10.01, 0.5)
+    X, Y = np.meshgrid(g, g)
+    pts = np.stack([X.ravel(), Y.ravel()], 1)
+    pts = pts[np.hypot(*pts.T) > 4]
+    tri = Delaunay(pts).simplices
+    tri = tri[np.hypot(*pts[tri].mean(1).T) > 4]
+    base = Mesh(np.c_[pts, np.zeros(len(pts))], tri)
+    base = Mesh(base.vertices, np.where((base.face_normals()[:, 2] < 0)[:, None], tri[:, ::-1], tri))
+    # insert: a ring from r=1 to r=3.2 with a 0.8 mm gap to the hole, slightly above
+    a = np.linspace(0, 2 * np.pi, 40, endpoint=False)
+    rs = np.arange(1.0, 3.21, 0.4)
+    v = np.array([(r * np.cos(t), r * np.sin(t), 0.05) for r in rs for t in a])
+    f = []
+    for k in range(len(rs) - 1):
+        for i in range(40):
+            p, q = k * 40 + i, k * 40 + (i + 1) % 40
+            f += [(p, q, p + 40), (q, q + 40, p + 40)]
+    ins = Mesh(v, np.array(f)[:, ::-1])  # stored the other way round on purpose
+    out, joined = fuse_meshes([base, ins], gap=1.0)
+    assert joined == 1
+    assert out.connected_components()[0] == 1
+    e = np.concatenate([out.faces[:, [0, 1]], out.faces[:, [1, 2]], out.faces[:, [2, 0]]])
+    assert len(np.unique(e, axis=0)) == len(e)  # consistently oriented, no edge used twice the same way
+    assert len(boundary_loops(out.faces)) == 2  # outer edge of the base + inner edge of the ring

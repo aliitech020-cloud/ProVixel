@@ -339,21 +339,43 @@ class MainWindow(QMainWindow):
         self.viewer.add_model(model, fit=True)
         self.panel.add_model(model)
 
-    def merge_models(self):
-        """Combine the selected models (or all visible ones) into one new model."""
+    def merge_models(self, fuse=None, gap=None):
+        """Combine the selected models (or all visible ones) into one new model.
+
+        fuse=None asks how (combine only, or fuse into one connected surface)."""
         parts = [self.viewer.models[r] for r in self.panel.selected_rows()]
         if len(parts) < 2:
             parts = [m for m in self.viewer.models if m.visible]
         if len(parts) < 2:
             QMessageBox.information(self, tr("merge"), tr("merge_need"))
             return
+        interactive = fuse is None
+        if fuse is None:
+            choice = self._ask_merge_mode()
+            if choice is None:
+                return
+            fuse, gap = choice
         self.cut.cancel()
         self.align.stop_picking()
         for m in parts:
             m.clear_selection()
-        mesh = merge_meshes([m.mesh.transformed(m.matrix) for m in parts], [m.color for m in parts])
+        meshes = [m.mesh.transformed(m.matrix) for m in parts]
+        joined = 0
+        if fuse:
+            from .fuse import fuse_meshes
+
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                mesh, joined = fuse_meshes(meshes, gap or 1.0, fallback_colors=[m.color for m in parts],
+                                           progress=lambda t: (self.statusBar().showMessage(t),
+                                                               QApplication.processEvents()))
+            finally:
+                QApplication.restoreOverrideCursor()
+        else:
+            mesh = merge_meshes(meshes, [m.color for m in parts])
         names = " + ".join(m.name for m in parts)
-        name = "Merged - " + names if len(names) < 60 else f"Merged ({len(parts)} models)"
+        label = "Fused" if fuse else "Merged"
+        name = f"{label} - " + names if len(names) < 60 else f"{label} ({len(parts)} models)"
         for m in parts:
             m.set_visible(False)
         first = parts[0]
@@ -363,7 +385,52 @@ class MainWindow(QMainWindow):
         self._add_model(merged)
         self.panel.refresh_rows()
         self._models_changed()
-        self.statusBar().showMessage(tr("merge_done", n=len(parts), faces=mesh.n_faces))
+        if fuse:
+            self.statusBar().showMessage(tr("fuse_done", n=len(parts), joined=joined, faces=mesh.n_faces))
+            if joined < len(parts) - 1 and interactive:
+                QMessageBox.information(self, tr("merge"), tr("fuse_not_touching"))
+        else:
+            self.statusBar().showMessage(tr("merge_done", n=len(parts), faces=mesh.n_faces))
+
+    def _ask_merge_mode(self):
+        """(fuse, gap) or None when cancelled. The choice is remembered."""
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel,
+                                       QRadioButton, QVBoxLayout)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("merge"))
+        lay = QVBoxLayout(dlg)
+        r_combine = QRadioButton(tr("merge_combine"))
+        r_fuse = QRadioButton(tr("merge_fuse"))
+        lay.addWidget(r_combine)
+        lay.addWidget(r_fuse)
+        info = QLabel(tr("merge_fuse_info"))
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #9aa0a6;")
+        lay.addWidget(info)
+        form = QFormLayout()
+        gap = QDoubleSpinBox()
+        gap.setRange(0.1, 5.0)
+        gap.setSingleStep(0.1)
+        gap.setDecimals(1)
+        gap.setSuffix(" mm")
+        gap.setValue(float(self.settings.value("fuse_gap", 1.0)))
+        form.addRow(tr("fuse_gap"), gap)
+        lay.addLayout(form)
+        fuse_on = str(self.settings.value("merge_fuse", "true")).lower() == "true"
+        (r_fuse if fuse_on else r_combine).setChecked(True)
+        gap.setEnabled(fuse_on)
+        r_fuse.toggled.connect(lambda on: gap.setEnabled(on))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(lambda: dlg.accept())
+        buttons.rejected.connect(lambda: dlg.reject())
+        lay.addWidget(buttons)
+        dlg.setMinimumWidth(380)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        self.settings.setValue("merge_fuse", "true" if r_fuse.isChecked() else "false")
+        self.settings.setValue("fuse_gap", gap.value())
+        return r_fuse.isChecked(), gap.value()
 
     def _model_selected(self, row):
         m = self.active_model()
