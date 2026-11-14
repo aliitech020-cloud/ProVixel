@@ -292,6 +292,10 @@ class ModelsPanel(QFrame):
         self.viewer.render()
         if not render_only:
             self.on_change()
+        else:  # e.g. opacity: no tool needs to know, but an open case is saved
+            touch = getattr(self.window_, "_case_touch", None)
+            if touch is not None:
+                touch()
 
     def _resize_list(self):
         n = self.list.count()

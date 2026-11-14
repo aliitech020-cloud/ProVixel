@@ -397,3 +397,31 @@ def test_text_label_engrave_closed():
         assert out.connected_components()[0] == 1
         e = np.concatenate([out.faces[:, [0, 1]], out.faces[:, [1, 2]], out.faces[:, [2, 0]]])
         assert len(np.unique(e, axis=0)) == len(e)
+
+
+def test_case_steps_roundtrip(tmp_path):
+    """A case stores every step; unchanged imports keep only their file location."""
+    from proview.cases import Case, CaseInfo, ModelState, list_cases, mesh_hash
+    from proview.mesh import save_ply
+
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1.0]])
+    f = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]])
+    src = tmp_path / "scan.ply"
+    scan = Mesh(v, f)
+    save_ply(str(src), scan)
+    case = Case.create(str(tmp_path / "cases"), CaseInfo("أحمد علي", "Dr. Sara", "2026-11-14", case_no="17"))
+    assert os.path.basename(case.path) == "2026-11-14_أحمد علي"
+    s1 = ModelState("scan", mesh_hash(scan), None, str(src), np.eye(4).ravel().tolist(), "Stone - Blue",
+                    [0.5, 0.6, 0.9])
+    case.add_step("Import", [s1])
+    edited = Mesh(v * 2, f)
+    h, rel = case.store_mesh(edited)
+    s2 = ModelState("scan", h, rel, str(src), np.eye(4).ravel().tolist(), "Stone - Blue", [0.5, 0.6, 0.9])
+    case.add_step("Cut", [s2])
+    case.add_step("Cut", [s2], replace_last=True)  # same tool again: no extra step
+    again = Case.load(case.path)
+    assert [s["label"] for s in again.steps] == ["Import", "Cut"]
+    assert np.allclose(again.load_state_mesh(again.step_states(1)[0]).vertices, v)  # from the original file
+    assert np.allclose(again.load_state_mesh(again.step_states()[0]).vertices, v * 2)  # copy in the case
+    assert again.info.patient == "أحمد علي"
+    assert [c.path for c in list_cases(str(tmp_path / "cases"))] == [case.path]

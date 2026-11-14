@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
     QFileDialog,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QScrollArea,
@@ -31,6 +32,7 @@ from .mesh import MESH_EXTENSIONS, load_mesh, merge_meshes, save_mesh
 from .model import MATERIALS, Model
 from .models_panel import ModelsPanel, ViewBar
 from .builder_tool import BuilderPanel
+from .cases import Case, CaseError, CaseInfo, ModelState, default_root, mesh_hash
 from .orient_tool import OrientController, OrientPanel
 from .repair_tool import RepairPanel, SculptTool
 from .section_tool import SectionController, SectionPanel
@@ -83,6 +85,16 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._build_shortcuts()
         self.statusBar().showMessage(tr("drop_hint"))
+        # ---- cases
+        self.case: Case | None = None
+        self._case_label = None  # label of the step being edited (None = only update the last step)
+        self._case_timer = QTimer(self)
+        self._case_timer.setSingleShot(True)
+        self._case_timer.timeout.connect(lambda: self._case_flush())
+        self.save_lbl = QLabel("")
+        self.save_lbl.setStyleSheet("color: #9aa0a6; padding: 0 8px;")
+        self.statusBar().addPermanentWidget(self.save_lbl)
+        self._update_case_ui()
 
     # ================================================================ UI
     def _build_tools_dock(self):
@@ -145,6 +157,23 @@ class MainWindow(QMainWindow):
             m.addAction(a)
         m.addSeparator()
         m.addAction(a_exit)
+
+        mc = mb.addMenu("&Case")
+        self.a_case_new = self._act("New case...", lambda: self.new_case())
+        self.a_case_open = self._act("Open case...", lambda: self.open_case())
+        self.a_case_save_as = self._act("Save as case...", lambda: self.new_case(from_scene=True))
+        self.a_case_save_as.setToolTip("Keep the models that are open now as a new case")
+        self.a_case_info = self._act("Case information...", lambda: self.edit_case_info())
+        self.a_case_history = self._act("History (saved steps)...", lambda: self.case_history(), "Ctrl+H")
+        self.a_case_folder = self._act("Open case folder", lambda: self.open_case_folder())
+        self.a_case_close = self._act("Close case", lambda: self.close_case())
+        self.a_case_root = self._act("Cases folder...", lambda: self.choose_cases_folder())
+        for a in (self.a_case_new, self.a_case_open, self.a_case_save_as, None, self.a_case_info,
+                  self.a_case_history, self.a_case_folder, self.a_case_close, None, self.a_case_root):
+            if a is None:
+                mc.addSeparator()
+            else:
+                mc.addAction(a)
 
         a_undo = self._act(tr("undo"), self.undo, QKeySequence.Undo, icon_name="undo")
         mb.addMenu(tr("menu_edit")).addAction(a_undo)
@@ -324,7 +353,10 @@ class MainWindow(QMainWindow):
                     QApplication.setOverrideCursor(Qt.WaitCursor)
                     continue
                 name = os.path.splitext(os.path.basename(p))[0]
-                self._add_model(Model(name, mesh, path=p))
+                model = Model(name, mesh, path=os.path.abspath(p))
+                model.source_hash = mesh_hash(mesh)  # unchanged models only keep the file's location
+                self._add_model(model)
+                self._case_touch("Import")
                 self._last_dir = os.path.dirname(p)
                 self.settings.setValue("last_dir", self._last_dir)
                 self.statusBar().showMessage(tr("loaded", name=name, faces=mesh.n_faces))
@@ -389,6 +421,7 @@ class MainWindow(QMainWindow):
                        material=first.material if first.material in MATERIALS else None)
         merged.dirty = True
         self._add_model(merged)
+        self._case_touch("Fuse" if fuse else "Merge")
         self.panel.refresh_rows()
         self._models_changed()
         if fuse:
@@ -485,6 +518,7 @@ class MainWindow(QMainWindow):
         self._models_changed()
 
     def _models_changed(self):
+        self._case_touch()
         self.align_panel.refresh_models()
         self.section_panel.refresh_models()
         if self.section.active:
@@ -502,6 +536,7 @@ class MainWindow(QMainWindow):
         self.viewer.remove_model(m)
         self.panel.remove_row(row)
         self.undo_stack = [u for u in self.undo_stack if u[0] is not m]
+        self._case_touch("Remove model")
         self._models_changed()
 
     def _toggle_edges(self, on):
@@ -566,6 +601,7 @@ class MainWindow(QMainWindow):
     # ============================================================== undo
     def push_undo(self, model: Model):
         model.dirty = True
+        self._case_touch(self._tool_label())
         self.undo_stack.append((model, model.mesh, model.matrix.copy(), None, model.selection.copy()))
         self._trim_undo()
 
@@ -587,6 +623,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(tr("nothing_to_undo"), 3000)
             return
         model, mesh, matrix, selection, kept_selection = self.undo_stack.pop()
+        if selection is None:
+            self._case_touch("Undo")
         if model not in self.viewer.models:
             return
         if selection is not None:
@@ -719,6 +757,7 @@ class MainWindow(QMainWindow):
         built = Model(f"{source.name}{suffix}", mesh, material="Stone - Yellow")
         built.dirty = True
         self._add_model(built)
+        self._case_touch("Model")
         # select just the new model(s): pressing Create again must not rebuild from the results
         if first:
             self.model_list.clearSelection()
@@ -795,6 +834,9 @@ class MainWindow(QMainWindow):
 
     def _confirm_unsaved(self) -> bool:
         """Ask before closing when models were changed and not saved. False = stay open."""
+        if self.case is not None:  # a case saves every step by itself
+            self._case_flush(force=True)
+            return True
         dirty = [m for m in self.viewer.models if m.dirty]
         if not dirty:
             return True
@@ -815,6 +857,299 @@ class MainWindow(QMainWindow):
             m.dirty = False
             self._last_dir = os.path.dirname(path)
         return True
+
+    # ============================================================== cases
+    def _cases_root(self) -> str:
+        return str(self.settings.value("cases/root", "") or default_root())
+
+    def _recent_cases(self) -> list[str]:
+        v = self.settings.value("cases/recent", [])
+        v = [v] if isinstance(v, str) else list(v or [])
+        return [p for p in v if p and os.path.isdir(p)]
+
+    def _remember_case(self, path):
+        recent = [path] + [p for p in self._recent_cases() if os.path.normcase(p) != os.path.normcase(path)]
+        self.settings.setValue("cases/recent", recent[:12])
+
+    def _tool_label(self) -> str:
+        if self.a_repair.isChecked():
+            return {"cut": "Cut", "build": "Add / Carve", "smooth": "Smooth"}.get(
+                getattr(self.repair_panel, "tool", ""), "Repair")
+        if self.a_builder.isChecked():
+            return "Text" if self.builder_panel.place_btn.isChecked() else "Model"
+        for a, label in ((self.a_align, "Align"), (self.a_orient, "Orient"), (self.a_survey, "Undercut"),
+                         (self.a_section, "Section")):
+            if a.isChecked():
+                return label
+        return "Edit"
+
+    def _case_touch(self, label=None):
+        """Something changed: save the case shortly (a new step when ``label`` is given)."""
+        if getattr(self, "case", None) is None or getattr(self, "_loading", False):
+            return
+        if label:
+            self._case_label = label
+        self.save_lbl.setText("Saving...")
+        self._case_timer.start(1200)
+
+    def _model_state(self, m: Model) -> ModelState:
+        h = mesh_hash(m.mesh)
+        if m.path and getattr(m, "source_hash", None) == h and os.path.isfile(m.path):
+            rel = None  # unchanged import: only the original file's location is kept
+        else:
+            h, rel = self.case.store_mesh(m.mesh, h)
+        return ModelState(name=m.name, hash=h, mesh_file=rel, source=m.path,
+                          matrix=[float(x) for x in np.asarray(m.matrix).ravel()], material=m.material,
+                          color=[float(c) for c in m.color], opacity=float(m.opacity), visible=bool(m.visible))
+
+    MERGE_STEPS = {"Cut", "Add / Carve", "Smooth", "Orient", "Align", "Edit", "Undo", "Text"}
+
+    def _case_flush(self, force=False):
+        """Write the scene into the case: a new step, or the last step updated."""
+        if self.case is None:
+            return
+        if not force and QApplication.mouseButtons() != Qt.NoButton:  # still dragging: later
+            self._case_timer.start(800)
+            return
+        self._case_timer.stop()
+        case = self.case
+        label = self._case_label
+        self._case_label = None
+        try:
+            states = [self._model_state(m) for m in self.viewer.models]
+            if not case.steps:
+                case.add_step(label or "Start", states)
+            elif label is None:
+                case.add_step(case.steps[-1]["label"], states, replace_last=True)
+            else:
+                last = case.steps[-1]
+                import datetime as _dt
+
+                try:
+                    age = (_dt.datetime.now() - _dt.datetime.fromisoformat(last["time"])).total_seconds()
+                except (KeyError, ValueError):
+                    age = 1e9
+                same = last.get("label") == label and label in self.MERGE_STEPS and age < 90
+                case.add_step(label, states, replace_last=same)
+                if same:
+                    case.cleanup()
+            for m in self.viewer.models:
+                m.dirty = False
+            self.save_lbl.setText(f"Saved  ·  step {case.steps[-1]['n']}")
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+
+            from .diagnostics import log
+
+            log("case save failed\n" + traceback.format_exc())
+            self.save_lbl.setText("Not saved!")
+            self.statusBar().showMessage(f"Could not save the case: {exc}", 10000)
+
+    def _update_case_ui(self):
+        c = self.case
+        self.setWindowTitle(f"ProVixel - {c.info.title()}" if c else "ProVixel - Quick view")
+        for a in (self.a_case_info, self.a_case_history, self.a_case_folder, self.a_case_close):
+            a.setEnabled(c is not None)
+        self.a_case_save_as.setEnabled(c is None)
+        if c is None:
+            self.save_lbl.setText("Quick view (not saved automatically)")
+        elif c.steps:
+            self.save_lbl.setText(f"Saved  ·  step {c.steps[-1]['n']}")
+        else:
+            self.save_lbl.setText("Case: " + c.info.title())
+
+    def _clear_scene(self):
+        self._loading = True
+        try:
+            self._clear_scene_now()
+        finally:
+            self._loading = False
+
+    def _clear_scene_now(self):
+        for a in (self.a_align, self.a_section, self.a_orient, self.a_repair, self.a_survey, self.a_builder):
+            if a.isChecked():
+                a.setChecked(False)
+        self.cut.cancel()
+        self.align.stop_picking()
+        for row in range(len(self.viewer.models) - 1, -1, -1):
+            self.viewer.remove_model(self.viewer.models[row])
+            self.panel.remove_row(row)
+        self.undo_stack = []
+        self._models_changed()
+        self.viewer.render()
+
+    def _leave_current(self) -> bool:
+        """Before another case is opened: save the case, or ask about unsaved quick-view models."""
+        if self.case is not None:
+            self._case_flush(force=True)
+            return True
+        return self._confirm_unsaved()
+
+    def new_case(self, info: CaseInfo | None = None, files=None, from_scene=False, root=None) -> bool:
+        from .case_ui import CaseInfoDialog
+
+        if info is None:
+            dlg = CaseInfoDialog(self, title="Save as case" if from_scene else "New case")
+            if dlg.exec() != dlg.Accepted:
+                return False
+            info = dlg.info()
+        if not from_scene and not self._leave_current():
+            return False
+        if from_scene and self.case is not None:
+            self._case_flush(force=True)
+        try:
+            case = Case.create(root or self._cases_root(), info)
+        except OSError as exc:
+            QMessageBox.warning(self, "New case", f"Could not create the case folder:\n{exc}")
+            return False
+        if not from_scene:
+            self._clear_scene()
+        self.case = case
+        self._remember_case(case.path)
+        self._case_label = "Start"
+        self._case_flush(force=True)
+        self._update_case_ui()
+        if files:
+            self.open_files(files)
+            self._case_flush(force=True)
+        self.statusBar().showMessage(f"Case folder: {case.path}", 8000)
+        return True
+
+    def open_case(self, path: str | None = None) -> bool:
+        from .case_ui import CaseBrowser
+
+        if path is None:
+            dlg = CaseBrowser(self._cases_root(), self)
+            if dlg.exec() != dlg.Accepted:
+                return False
+            if dlg.new_requested:
+                return self.new_case()
+            path = dlg.chosen
+            if not path:
+                return False
+        try:
+            case = Case.load(path)
+            states = case.step_states()
+        except (CaseError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Open case", str(exc))
+            return False
+        if not self._leave_current():
+            return False
+        self._clear_scene()
+        self.case = case
+        self._remember_case(case.path)
+        self._load_states(states)
+        self._update_case_ui()
+        self.statusBar().showMessage(f"Opened case {case.info.title()}  ({len(case.steps)} steps)", 8000)
+        return True
+
+    def _load_states(self, states):
+        from .model import MATERIALS as _MAT
+
+        self._loading = True
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        missing = []
+        try:
+            for s in states:
+                try:
+                    mesh = self.case.load_state_mesh(s)
+                except (CaseError, OSError, ValueError) as exc:
+                    missing.append(str(exc))
+                    continue
+                known = s.material in _MAT
+                m = Model(s.name, mesh, path=s.source, color=None if known else s.color,
+                          material=s.material if known else None)
+                m.source_hash = s.hash if s.mesh_file is None else None
+                self._add_model(m)
+                m.set_matrix(np.array(s.matrix, float).reshape(4, 4))
+                if s.opacity < 1.0:
+                    m.set_opacity(s.opacity)
+                if not s.visible:
+                    m.set_visible(False)
+            self.panel.refresh_rows()
+            self.viewer.fit()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._loading = False
+        self._loading = True
+        self._models_changed()
+        self._loading = False
+        self._case_timer.stop()
+        self._case_label = None
+        self._update_case_ui()
+        if missing:
+            QMessageBox.warning(self, "Open case", "\n\n".join(missing))
+
+    def edit_case_info(self):
+        from .case_ui import CaseInfoDialog
+
+        if self.case is None:
+            return
+        dlg = CaseInfoDialog(self, self.case.info, title="Case information")
+        if dlg.exec() != dlg.Accepted:
+            return
+        self.case.info = dlg.info()
+        self.case.save()
+        self._update_case_ui()
+
+    def case_history(self, restore: int | None = None):
+        from .case_ui import HistoryDialog
+
+        if self.case is None:
+            return
+        self._case_flush(force=True)
+        if restore is None:
+            dlg = HistoryDialog(self.case, self)
+            if dlg.exec() != dlg.Accepted or dlg.chosen is None:
+                return
+            restore = dlg.chosen
+        try:
+            states = self.case.step_states(restore)
+        except (CaseError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "History", str(exc))
+            return
+        self._clear_scene()
+        self._load_states(states)
+        self._case_label = f"Restored step {restore}"
+        self._case_flush(force=True)
+
+    def open_case_folder(self):
+        from .case_ui import open_folder
+
+        if self.case is not None:
+            open_folder(self.case.path)
+
+    def close_case(self):
+        if self.case is None:
+            return
+        self._case_flush(force=True)
+        self.case.cleanup()
+        self._clear_scene()
+        self.case = None
+        self._update_case_ui()
+
+    def choose_cases_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "Cases folder", self._cases_root())
+        if path:
+            self.settings.setValue("cases/root", path)
+            self.statusBar().showMessage(f"New cases are saved in {path}", 8000)
+
+    def start_screen(self, files=None):
+        """First question when ProVixel starts: quick view, new case or open a case."""
+        from .case_ui import StartDialog
+
+        dlg = StartDialog(self._cases_root(), self._recent_cases(), self, files)
+        dlg.exec()
+        ok = False
+        if dlg.choice == StartDialog.NEW:
+            ok = self.new_case(files=files)
+            files = None if ok else files
+        elif dlg.choice == StartDialog.OPEN:
+            ok = self.open_case()
+        elif dlg.choice == StartDialog.RECENT and dlg.recent_path:
+            ok = self.open_case(dlg.recent_path)
+        if files:
+            self.open_files(files)
 
     def closeEvent(self, ev):
         if not self._confirm_unsaved():
@@ -894,8 +1229,7 @@ def main(argv=None):
         QTimer.singleShot(1500, lambda: diagnostics.run_selftest(win, app, out))
         _exit_now(app.exec(), settings)
     files = [a for a in argv[1:] if a.lower().endswith(MESH_EXTENSIONS) and os.path.isfile(a)]
-    if files:
-        win.open_files(files)
+    QTimer.singleShot(300, lambda: win.start_screen(files))
     _exit_now(app.exec(), settings)
 
 

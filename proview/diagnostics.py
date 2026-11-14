@@ -227,6 +227,30 @@ def run_selftest(win, app, out_png: str) -> None:
         win.model_list.selectAll()
         win.merge_models(fuse=True, gap=1.0)
         log("selftest: merge ok")
+        # cases: save the scene as a case, change something, reopen, restore the first step
+        import tempfile
+
+        from .cases import Case, CaseInfo
+
+        root = tempfile.mkdtemp(prefix="provixel_cases_")
+        n_models = len(win.viewer.models)
+        assert win.new_case(CaseInfo("Selftest Patient", "Dr. Test", case_no="1", teeth="36"), from_scene=True,
+                            root=root)
+        path = win.case.path
+        m0 = win.viewer.models[0]
+        win.push_undo(m0)
+        m0.set_mesh(m0.mesh.remove_faces(np.arange(m0.mesh.n_faces) < 10))
+        win._case_flush(force=True)
+        assert len(win.case.steps) == 2, win.case.steps
+        win.close_case()
+        assert not win.viewer.models
+        assert win.open_case(path)
+        assert len(win.viewer.models) == n_models
+        assert win.viewer.models[0].mesh.n_faces == m0.mesh.n_faces
+        win.case_history(restore=1)
+        assert len(Case.load(path).steps) == 3
+        win.close_case()
+        log("selftest: cases ok")
         win.viewer.screenshot(out_png)
         log("selftest: PASSED")
         app.exit(0)
