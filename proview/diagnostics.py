@@ -174,6 +174,48 @@ def run_selftest(win, app, out_png: str) -> None:
         win.undo()
         win.a_repair.setChecked(False)
         log("selftest: island select + sculpt ok")
+        # model builder panel: set from view, live preview, text label
+        import time as _time
+
+        from PySide6.QtWidgets import QMessageBox as _QMB
+
+        def _fail(*args, **_kw):
+            raise AssertionError(str(args[2]) if len(args) > 2 else "message box")
+
+        _orig_warning = _QMB.warning
+        _QMB.warning = staticmethod(_fail)
+        try:
+            win.model_list.setCurrentRow(0)
+            win.a_builder.setChecked(True)
+            bp = win.builder_panel
+            bp.set_from_view()
+            assert bp.options().up is not None
+            bp.auto.setChecked(True)
+            assert bp.options().up is None
+            bp.live.setChecked(True)
+            bp.update_preview()
+            t0 = _time.time()
+            while bp.model_preview.running and _time.time() - t0 < 120:
+                app.processEvents()
+                _time.sleep(0.05)
+            app.processEvents()
+            log(f"selftest: live preview shown={bp.model_preview.shown}")
+            bp.live.setChecked(False)  # back to the scan itself for the text
+            from .builder_tool import TextPlacer
+
+            bp.text.setText("PV 1,2")
+            bp.text_size.setValue(2.0)
+            placer = TextPlacer(bp)
+            hit = placer._frame_at(*project_center(win.viewer, win.viewer.models[0]))
+            assert hit is not None, "text: no surface under the centre"
+            n_before = hit[3].mesh.n_faces
+            bp.place_text(*hit)
+            assert hit[3].mesh.n_faces != n_before, "text was not added"
+            win.undo()
+            win.a_builder.setChecked(False)
+        finally:
+            _QMB.warning = _orig_warning
+        log("selftest: builder preview + text ok")
         win.a_survey.setChecked(True)
         win.survey.set_from_view()
         win.survey.tilt("x", 5)

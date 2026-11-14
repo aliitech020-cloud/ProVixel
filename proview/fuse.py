@@ -48,15 +48,24 @@ def _zipper(P: np.ndarray, Q: np.ndarray, pv: np.ndarray, qv: np.ndarray) -> lis
     P must be an edge loop as stored by ``boundary_loops`` of its surface (a->b in its faces)
     and Q the reverse of the other surface's loop; then the strip is oriented like both."""
     faces = []
-    i = j = 0
     n, m = len(P), len(Q)
+
+    def frac(pts):  # position along the polyline, 0 at the start, 1 at the end
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        c = np.concatenate([[0.0], np.cumsum(seg)])
+        return c / c[-1] if c[-1] > 0 else np.linspace(0, 1, len(pts))
+
+    fp, fq = frac(pv), frac(qv)
+    i = j = 0
     while i < n - 1 or j < m - 1:
+        # advance along the edge whose next point comes first (both edges run side by side,
+        # so the share of their length walked so far matches; robust to different point spacing)
         if i == n - 1:
             adv_p = False
         elif j == m - 1:
             adv_p = True
         else:
-            adv_p = np.linalg.norm(pv[i + 1] - qv[j]) <= np.linalg.norm(pv[i] - qv[j + 1])
+            adv_p = fp[i + 1] <= fq[j + 1]
         if adv_p:
             faces.append((P[i + 1], P[i], Q[j]))
             i += 1
@@ -91,7 +100,7 @@ def _runs(mask: np.ndarray, closed: bool) -> list[tuple[int, int]]:
 
 
 def fuse_pair(base: Mesh, insert: Mesh, gap: float = 1.0, progress=lambda text: None,
-              region=None) -> tuple[Mesh, int]:
+              region=None, trim: bool = True) -> tuple[Mesh, int]:
     """Fuse ``insert`` into ``base`` (both in the same space). Returns (mesh, joined edge length in
     vertices; 0 means the scans did not meet and were only combined)."""
     if base.n_faces == 0 or insert.n_faces == 0:
@@ -107,18 +116,20 @@ def fuse_pair(base: Mesh, insert: Mesh, gap: float = 1.0, progress=lambda text: 
     else:
         edge_dist = np.full(len(samples), np.inf)
 
-    progress("Removing the covered surface")
-    d, idx = tree.query(base.vertices, distance_upper_bound=gap + 1.0)
-    near = np.isfinite(d)
-    covered = np.zeros(base.n_vertices, bool)
-    covered[near] = (d[near] < TRIM) | ((d[near] < gap) & (edge_dist[idx[near]] > d[near] + TRIM))
-    if not covered.any() and not near.any():
-        return merge_meshes([base, insert]), 0
-    trimmed = base.remove_faces(covered[base.faces].any(1))
-    trimmed = _drop_small_pieces(remove_dangling_faces(trimmed)) if trimmed.n_faces else trimmed
-    if trimmed.n_faces == 0:
-        return insert.copy(), 0
-
+    if trim:
+        progress("Removing the covered surface")
+        d, idx = tree.query(base.vertices, distance_upper_bound=gap + 1.0)
+        near = np.isfinite(d)
+        covered = np.zeros(base.n_vertices, bool)
+        covered[near] = (d[near] < TRIM) | ((d[near] < gap) & (edge_dist[idx[near]] > d[near] + TRIM))
+        if not covered.any() and not near.any():
+            return merge_meshes([base, insert]), 0
+        trimmed = base.remove_faces(covered[base.faces].any(1))
+        trimmed = _drop_small_pieces(remove_dangling_faces(trimmed)) if trimmed.n_faces else trimmed
+        if trimmed.n_faces == 0:
+            return insert.copy(), 0
+    else:
+        trimmed = base
     progress("Joining the edges")
     ins = insert
     joined, extra_faces = _join(trimmed, ins, gap, region)

@@ -374,3 +374,26 @@ def test_fuse_leaves_far_edges_open():
     assert joined == 1
     t = out.vertices[out.faces]
     assert np.linalg.norm(t - np.roll(t, 1, axis=1), axis=2).max() < 4.0
+
+
+def test_text_label_engrave_closed():
+    """Engraving text keeps a closed model closed and in one piece."""
+    from PySide6.QtGui import QGuiApplication
+    from scipy.spatial import ConvexHull
+
+    from proview.model_builder import boundary_loops
+    from proview.text_label import apply_text
+
+    _app = QGuiApplication.instance() or QGuiApplication([])  # noqa: F841
+    u, v = np.meshgrid(np.linspace(0, 2 * np.pi, 160, endpoint=False), np.linspace(0, np.pi, 80))
+    pts = np.stack([20 * np.cos(u) * np.sin(v), 12 * np.sin(u) * np.sin(v), 10 * np.cos(v)], -1).reshape(-1, 3)
+    f = ConvexHull(pts).simplices.copy()
+    m = Mesh(pts, f)
+    flip = np.einsum("ij,ij->i", m.face_normals(), m.face_centroids()) < 0
+    f[flip] = f[flip][:, ::-1]
+    for depth in (-0.5, 0.5):
+        out = apply_text(Mesh(pts, f), [0, -12, 0], [0, -1, 0], [0, 0, 1], "A1, b/2", 3.0, depth)
+        assert not boundary_loops(out.faces)
+        assert out.connected_components()[0] == 1
+        e = np.concatenate([out.faces[:, [0, 1]], out.faces[:, [1, 2]], out.faces[:, [2, 0]]])
+        assert len(np.unique(e, axis=0)) == len(e)

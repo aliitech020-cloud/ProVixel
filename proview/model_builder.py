@@ -32,6 +32,7 @@ class BuildOptions:
     auto_orient: bool = True  # find the teeth direction (upper / lower jaw) automatically
     trim: bool = True  # cut the scan's edge flat (removes hanging tissue, undercut flaps)
     trim_offset: float = 0.0  # mm; 0 = automatic level, positive = cut higher
+    up: tuple | None = None  # teeth direction in world space (e.g. set from the view); overrides auto
 
 
 MAX_VOXELS = 40_000_000
@@ -280,9 +281,10 @@ def build_model(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> M
     v = scan.vertices
     main = max(loops, key=lambda lp: _loop_length(v, lp))
     R = np.eye(3)
-    if opts.auto_orient:
-        # teeth direction: away from the plane of the open edge, towards the bulk of the scan
-        R = rotation_to_z(detect_up(v, main, scan.faces))
+    turned = opts.up is not None or opts.auto_orient
+    if turned:
+        # teeth direction: given (from the view) or away from the open edge, towards the scan
+        R = rotation_to_z(np.asarray(opts.up, float) if opts.up is not None else detect_up(v, main, scan.faces))
         scan = Mesh(v @ R.T, scan.faces, scan.colors)
         v = scan.vertices
     edge_z = v[main][:, 2].mean()
@@ -366,7 +368,7 @@ def build_model(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> M
         progress("Checking the model is closed")
         result, _, _ = fill_holes(result, None)
         result = Mesh(result.vertices, result.faces)
-    if opts.auto_orient:  # back to the scan's own position
+    if turned:  # back to the scan's own position
         result = Mesh(result.vertices @ R, result.faces)
     return result
 
@@ -469,7 +471,10 @@ def base_frame(scan: Mesh, opts: "BuildOptions"):
         raise BuildError("The model is already closed (no open edge). Use a scan, not a solid model.")
     v = scan.vertices
     main = max(loops, key=lambda lp: _loop_length(v, lp))
-    R = rotation_to_z(detect_up(v, main, scan.faces)) if opts.auto_orient else np.eye(3)
+    if opts.up is not None:
+        R = rotation_to_z(np.asarray(opts.up, float))
+    else:
+        R = rotation_to_z(detect_up(v, main, scan.faces)) if opts.auto_orient else np.eye(3)
     z_cut = trim_level(v @ R.T, main, opts) if opts.trim else None
     return R, main, z_cut
 
