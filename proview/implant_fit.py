@@ -157,10 +157,20 @@ def profile(points, normals, cyl: Cylinder) -> np.ndarray:
 
 
 def profile_distance(a, b) -> float:
-    ok = np.isfinite(a) & np.isfinite(b)
-    if ok.sum() < 3:
-        return np.inf
-    return float(np.mean(np.abs(a[ok] - b[ok])))
+    """Mean difference of two profiles; the slices may be shifted by up to 2 (the scanned top is
+    not always where the library's top is)."""
+    n = len(PROFILE_SLICES)
+    best = np.inf
+    for sh in range(-2, 3):
+        ia = np.arange(max(0, -sh), min(n, n - sh))
+        ib = ia + sh
+        pa = np.concatenate([a[ia], a[n + ia]])
+        pb = np.concatenate([b[ib], b[n + ib]])
+        ok = np.isfinite(pa) & np.isfinite(pb)
+        if ok.sum() < 3:
+            continue
+        best = min(best, float(np.mean(np.abs(pa[ok] - pb[ok]))) + 0.02 * abs(sh))
+    return best
 
 
 # ---------------------------------------------------------------------- library shapes
@@ -324,34 +334,43 @@ def search_cylinder(cen, fn, areas, click, r_range=(1.0, 3.6), inward=False):
     if len(near) > 5000:  # enough samples; keeps the search fast on dense scans
         near = np.random.default_rng(0).choice(near, 5000, replace=False)
     P, N, A = cen[near], fn[near], areas[near]
-    radii = np.arange(r_range[0], r_range[1] + 1e-9, 0.05)
-    best = None
-    for th in np.radians(np.arange(0, 180, 2.0)):
-        a = np.cos(th) * e1 + np.sin(th) * e2
-        na = N @ a
-        wall = np.abs(na) < 0.3
-        if wall.sum() < 10:
-            continue
-        Pw, Nw, Aw = P[wall], N[wall], A[wall]
-        relc = Pw - click
-        relc -= np.outer(relc @ a, a)  # perpendicular to the axis
-        Nw_perp = Nw - np.outer(Nw @ a, a)
-        Nw_perp /= np.linalg.norm(Nw_perp, axis=1, keepdims=True) + 1e-12
-        for sgn in (1.0, -1.0):  # centre on either side of the click (normals may be flipped)
-            off = sgn * n0  # perpendicular to every tried axis
-            # for every radius: distance of the wall points to the axis line through click - r * off
-            q = relc[None, :, :] + radii[:, None, None] * off[None, None, :]
-            rad = np.linalg.norm(q, axis=2)
-            on = np.abs(rad - radii[:, None]) < 0.08
-            rdir = q / (rad[..., None] + 1e-12)
-            facing = np.abs(np.einsum("rij,ij->ri", rdir, Nw_perp)) > 0.85
-            score = ((on & facing) * Aw[None, :]).sum(1)
-            k = int(np.argmax(score))
-            if best is None or score[k] > best[0]:
-                best = (float(score[k]), a, click - radii[k] * off, float(radii[k]))
+    def search(thetas, radii, P, N, A):
+        best = None
+        for th in thetas:
+            a = np.cos(th) * e1 + np.sin(th) * e2
+            wall = np.abs(N @ a) < 0.3
+            if wall.sum() < 10:
+                continue
+            Pw, Nw, Aw = P[wall], N[wall], A[wall]
+            relc = Pw - click
+            relc -= np.outer(relc @ a, a)  # perpendicular to the axis
+            Nw_perp = Nw - np.outer(Nw @ a, a)
+            Nw_perp /= np.linalg.norm(Nw_perp, axis=1, keepdims=True) + 1e-12
+            for sgn in (1.0, -1.0):  # centre on either side of the click (normals may be flipped)
+                off = sgn * n0  # perpendicular to every tried axis
+                q = relc[None, :, :] + radii[:, None, None] * off[None, None, :]
+                rad = np.linalg.norm(q, axis=2)
+                on = np.abs(rad - radii[:, None]) < 0.08
+                rdir = q / (rad[..., None] + 1e-12)
+                facing = np.abs(np.einsum("rij,ij->ri", rdir, Nw_perp)) > 0.85
+                score = ((on & facing) * Aw[None, :]).sum(1)
+                k = int(np.argmax(score))
+                if best is None or score[k] > best[0]:
+                    best = (float(score[k]), a, click - radii[k] * off, float(radii[k]), th)
+        return best
+
+    # coarse (6 degrees, 0.1 mm, fewer points), then fine around the best
+    sub = np.random.default_rng(2).choice(len(P), min(len(P), 1800), replace=False)
+    coarse = search(np.radians(np.arange(0, 180, 6.0)), np.arange(r_range[0], r_range[1] + 1e-9, 0.1),
+                    P[sub], N[sub], A[sub])
+    if coarse is None:
+        return None
+    th0, r0 = coarse[4], coarse[3]
+    best = search(th0 + np.radians(np.arange(-6, 6.01, 1.0)),
+                  np.arange(max(r_range[0], r0 - 0.15), min(r_range[1], r0 + 0.15) + 1e-9, 0.02), P, N, A)
     if best is None or best[0] < 2.0:  # less than ~2 mm2 of wall on the cylinder
         return None
-    _, a, c, r = best
+    _, a, c, r, _th = best
     rel = cen - c
     rad = np.linalg.norm(rel - np.outer(rel @ a, a), axis=1)
     inl = (np.abs(rad - r) < 0.15) & (np.abs(fn @ a) < 0.35) & (d < 12.0)
@@ -497,44 +516,76 @@ def _about(axis, ang):
     return np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * K @ K
 
 
-def _match_one(shape: MarkerShape, site: ScanSite) -> tuple[np.ndarray, float, float, float]:
-    """Best pose of the library shape on the scan: (T library->world, rms, inliers, coverage)."""
-    sc, mc = site.cyl, shape.cyl
+def _zone(site: ScanSite):
+    sc = site.cyl
     zone = (sc.radial(site.points) <= sc.radius + 0.6) & (sc.height(site.points) >= sc.top - 9.0)
-    src = site.points[zone]
-    src_n = site.normals[zone]
-    if len(src) < 30:
-        return np.eye(4), np.inf, 0.0, 0.0
-    if len(src) > 4000:
-        idx = np.random.default_rng(0).choice(len(src), 4000, replace=False)
+    src, src_n = site.points[zone], site.normals[zone]
+    if len(src) > 2500:
+        idx = np.random.default_rng(0).choice(len(src), 2500, replace=False)
         src, src_n = src[idx], src_n[idx]
+    return src, src_n
+
+
+def _quick_starts(shape: MarkerShape, site: ScanSite, src):
+    """Start poses (world -> library) scored without ICP: 12 turns x axial shifts of -3..+3 mm.
+    Returns (best quick score, starts sorted best first); lower is better."""
+    sc, mc = site.cyl, shape.cyl
+    quick = src if len(src) <= 1200 else src[np.random.default_rng(1).choice(len(src), 1200, replace=False)]
     R0 = _rot_to(mc.axis, sc.axis)
     top_m = mc.centre + mc.axis * (mc.top - mc.centre @ mc.axis)
     top_s = sc.centre + sc.axis * (sc.top - sc.centre @ sc.axis)
-    best = None
-    for k in range(12):  # unknown turn about the axis
+    starts = []
+    for k in range(12):
         R = _about(sc.axis, 2 * np.pi * k / 12) @ R0
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = top_s - R @ top_m
-        inv = np.linalg.inv(T)  # world -> library (ICP moves the scan onto the library shape)
-        res = icp(src, src_n, shape.target, init=inv, iterations=12, trim=0.85, max_distance=0.8)
-        if best is None or res.rms < best[1].rms or (res.rms == best[1].rms and res.inlier_fraction > best[1].inlier_fraction):
-            best = (k, res)
-    res = icp(src, src_n, shape.target, init=best[1].matrix, iterations=60, trim=0.9, max_distance=0.5)
+        for off in np.arange(-3.0, 3.01, 0.75):
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = top_s + sc.axis * off - R @ top_m
+            W = np.linalg.inv(T)
+            d, _ = shape.target.tree.query(quick @ W[:3, :3].T + W[:3, 3])
+            starts.append((float(np.mean(np.minimum(d, 0.3))), W, k))
+    starts.sort(key=lambda x: x[0])
+    # keep the best start of each turn: the ICP tries then cover different turns, not one turn's shifts
+    seen, diverse = set(), []
+    for st in starts:
+        if st[2] not in seen:
+            seen.add(st[2])
+            diverse.append(st)
+    return diverse[0][0], diverse
+
+
+def _refine(shape: MarkerShape, src, src_n, starts, tries=5):
+    """ICP from the best starts -> (T library->world, rms, inliers, coverage)."""
+    best = None
+    for _, W, _k in starts[:tries]:
+        res = icp(src, src_n, shape.target, init=W, iterations=20, trim=0.85, max_distance=0.8)
+        res = icp(src, src_n, shape.target, init=res.matrix, iterations=20, trim=0.9, max_distance=0.4)
+        Wr = res.matrix
+        d, _ = shape.target.tree.query(src @ Wr[:3, :3].T + Wr[:3, 3])
+        on = float((d < 0.1).mean())  # share of the scanned surface lying on the library shape
+        if best is None or on > best[0]:
+            best = (on, res)
+    res = icp(src, src_n, shape.target, init=best[1].matrix, iterations=30, trim=0.9, max_distance=0.3)
     W = res.matrix  # world -> library
-    p = (W[:3, :3] @ src.T).T + W[:3, 3]
+    p = src @ W[:3, :3].T + W[:3, 3]
     d, _ = shape.target.tree.query(p)
     inl = float((d < 0.1).mean())
     rms = float(np.sqrt(np.mean(d[d < 0.2] ** 2))) if (d < 0.2).any() else float(np.sqrt(np.mean(d ** 2)))
-    # how much of the library top the scan covers
-    tree = cKDTree(p)
-    dc, _ = tree.query(shape.top_pts)
+    dc, _ = cKDTree(p).query(shape.top_pts)
     cov = float((dc < 0.15).mean())
     return np.linalg.inv(W), rms, inl, cov
 
 
-def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, max_candidates=16,
+def _match_one(shape: MarkerShape, site: ScanSite) -> tuple[np.ndarray, float, float, float]:
+    """Best pose of the library shape on the scan: (T library->world, rms, inliers, coverage)."""
+    src, src_n = _zone(site)
+    if len(src) < 30:
+        return np.eye(4), np.inf, 0.0, 0.0
+    _, starts = _quick_starts(shape, site, src)
+    return _refine(shape, src, src_n, starts)
+
+
+def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, max_candidates=24,
              index: dict | None = None) -> list[Match]:
     """Library scan bodies ranked by how well they fit the scanned one (best first)."""
     if site.cyl is None:
@@ -563,15 +614,25 @@ def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, m
     ranked.sort(key=lambda r: r[0])
     out = []
     shortlist = ranked[:max_candidates]
+    src, src_n = _zone(site)
+    if len(src) < 30:
+        return []
+    # stage 1: every candidate, quick (no ICP); stage 2: ICP for the most promising ones
+    quick = []
     for k, (dist, es) in enumerate(shortlist):
         progress(f"Comparing {k + 1}/{len(shortlist)}: {es[0].title}")
         shape = marker_shape(es[0])
         if shape is None:
             continue
-        T, rms, inl, cov = _match_one(shape, site)
+        q, starts = _quick_starts(shape, site, src)
+        quick.append((q, shape, es, starts))
+    quick.sort(key=lambda x: x[0])
+    for k, (q, shape, es, starts) in enumerate(quick[:6]):
+        progress(f"Fitting {k + 1}/{min(6, len(quick))}: {es[0].title}")
+        T, rms, inl, cov = _refine(shape, src, src_n, starts)
         if not np.isfinite(rms):
             continue
-        score = inl * (0.4 + 0.6 * cov) * np.exp(-max(rms - 0.03, 0) / 0.08)
+        score = inl * (0.75 + 0.25 * cov) * np.exp(-max(rms - 0.03, 0) / 0.08)
         out.append(Match(es, shape, T, rms, inl, cov, float(score)))
     out.sort(key=lambda m: -m.score)
     return out

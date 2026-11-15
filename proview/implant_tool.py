@@ -136,7 +136,7 @@ class Overlay:
 class Wave:
     """A light wave that runs from the click over the scan body, then pulses while searching."""
 
-    SPEED = 16.0  # mm per second
+    SPEED = 8.0  # mm per second
     GLOW = (0.25, 0.85, 1.0)
 
     def __init__(self, viewer):
