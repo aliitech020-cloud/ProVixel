@@ -106,6 +106,11 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(_scrolled(self.repair_panel))
         self.survey_panel = SurveyPanel(self.survey)
         self.stack.addWidget(_scrolled(self.survey_panel))
+        from .implant_tool import ImplantPanel
+
+        self.implant_panel = ImplantPanel(self.viewer, lambda text: self.statusBar().showMessage(text),
+                                          settings=self.settings)
+        self.stack.addWidget(_scrolled(self.implant_panel))
         self.builder_panel = BuilderPanel(lambda: self._selected_models(),
                                           lambda src, mesh, part, first: self._add_built(src, mesh, part, first),
                                           lambda text: self.statusBar().showMessage(text),
@@ -194,6 +199,8 @@ class MainWindow(QMainWindow):
         self.a_builder = self._act(tr("tool_builder"), self._toggle_builder, checkable=True, icon_name="builder")
         self.a_repair = self._act(tr("tool_repair"), self._toggle_repair, "R", checkable=True, icon_name="repair")
         self.a_survey = self._act(tr("tool_survey"), self._toggle_survey, "U", checkable=True, icon_name="survey")
+        self.a_implant = self._act("Implant: find the system, suggest an abutment", self._toggle_implant, "I",
+                                   checkable=True, icon_name="implant")
         self.a_section = self._act(tr("tool_section"), self._toggle_section, "S", checkable=True,
                                    icon_name="section")
         grp = QActionGroup(self)
@@ -204,8 +211,10 @@ class MainWindow(QMainWindow):
         grp.addAction(self.a_builder)
         grp.addAction(self.a_survey)
         grp.addAction(self.a_repair)
+        grp.addAction(self.a_implant)
         mt = mb.addMenu(tr("menu_tools"))
-        for a in (self.a_cut, self.a_align, self.a_section, self.a_orient, self.a_repair, self.a_builder, self.a_survey, a_merge):
+        for a in (self.a_cut, self.a_align, self.a_section, self.a_orient, self.a_repair, self.a_builder, self.a_survey,
+                  self.a_implant, a_merge):
             mt.addAction(a)
 
         a_help = self._act(tr("shortcuts"), lambda: QMessageBox.information(self, tr("shortcuts"), tr("shortcut_text")),
@@ -243,7 +252,8 @@ class MainWindow(QMainWindow):
             ("PREPARE", [(self.a_align, tr("tile_align")), (self.a_orient, tr("tile_orient")),
                          (a_merge, tr("tile_merge"))]),
             ("EDIT", [(self.a_repair, tr("tile_repair"))]),
-            ("ANALYZE", [(self.a_section, tr("tile_section")), (self.a_survey, tr("tile_survey"))]),
+            ("ANALYZE", [(self.a_section, tr("tile_section")), (self.a_survey, tr("tile_survey")),
+                         (self.a_implant, "Implant")]),
             ("PRODUCE", [(self.a_builder, tr("tile_builder"))]),
         ]
         # view switches float under the navigation cube
@@ -736,6 +746,18 @@ class MainWindow(QMainWindow):
             if not self._any_panel_tool():
                 self.tools_dock.hide()
 
+    def _toggle_implant(self, on):
+        if on:
+            self.align.stop_picking()
+            self.stack.setCurrentWidget(self.implant_panel._scroll)
+            self.tools_dock.setWindowTitle("Implant")
+            self.tools_dock.show()
+            self.implant_panel.set_active(True)
+        else:
+            self.implant_panel.set_active(False)
+            if not self._any_panel_tool():
+                self.tools_dock.hide()
+
     def _survey_changed(self):
         if hasattr(self, "survey_panel"):
             self.survey_panel.refresh()
@@ -755,7 +777,7 @@ class MainWindow(QMainWindow):
 
     def _any_panel_tool(self):
         return any(a.isChecked() for a in (self.a_align, self.a_section, self.a_orient,
-                                           self.a_builder, self.a_survey, self.a_repair))
+                                           self.a_builder, self.a_survey, self.a_repair, self.a_implant))
 
     def _toggle_builder(self, on):
         if on:
@@ -1011,7 +1033,8 @@ class MainWindow(QMainWindow):
             self._loading = False
 
     def _clear_scene_now(self):
-        for a in (self.a_align, self.a_section, self.a_orient, self.a_repair, self.a_survey, self.a_builder):
+        for a in (self.a_align, self.a_section, self.a_orient, self.a_repair, self.a_survey, self.a_builder,
+                  self.a_implant):
             if a.isChecked():
                 a.setChecked(False)
         self.cut.cancel()

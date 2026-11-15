@@ -452,3 +452,74 @@ def test_text_on_base_wall_near_edge():
     out = apply_text(m, p, fn[k], [0, 0, 1], "AB 12", 3.0, -0.5, face=int(k))
     assert not boundary_loops(out.faces)
     assert out.connected_components()[0] == 1
+
+
+def _revolve(R, flat, top, bottom, nt=64, nz=40):
+    th = np.linspace(0, 2 * np.pi, nt, endpoint=False)
+    rings = []
+    for z in np.linspace(bottom, top, nz):
+        x, y = R * np.cos(th), R * np.sin(th)
+        if flat is not None and z > top - 4:
+            x = np.minimum(x, flat)
+        rings.append(np.column_stack([x, y, np.full(nt, z)]))
+    V = np.vstack(rings + [[[0, 0, bottom]], [[0, 0, top]]])
+    F = []
+    for k in range(nz - 1):
+        for i in range(nt):
+            a, b = k * nt + i, k * nt + (i + 1) % nt
+            F += [(a, b, a + nt), (b, b + nt, a + nt)]
+    for i in range(nt):
+        F += [(nz * nt, (i + 1) % nt, i), (nz * nt + 1, (nz - 1) * nt + i, (nz - 1) * nt + (i + 1) % nt)]
+    return Mesh(V, np.array(F))
+
+
+def test_implant_library_and_identification(tmp_path):
+    """exocad-style config.xml is read; the scanned scan body is matched to the right library entry and the
+    implant platform / axis come out where the analog is."""
+    from proview.implant_fit import identify, measure, platform_in_library, scan_site, suggest, Rules
+    from proview.implant_lib import scan_library
+    from proview.mesh import merge_meshes, save_stl
+
+    cfg = """<?xml version="1.0" encoding="utf-8"?>
+<!-- Created with exoImplantEditor -->
+<ImplantLibraryEntry xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <AxisOcclusal><x>0</x><y>0</y><z>1</z></AxisOcclusal>
+  <MarkerFilename>{m}</MarkerFilename>
+  <DisplayInformation>{n}</DisplayInformation>
+  <AxisScrewChannelMaxUserAngle IsDesignConstraint="true">20</AxisScrewChannelMaxUserAngle>
+  <TypeConfig><ImplantTypeConfig>
+    <ImplantFilename>Analog.STL</ImplantFilename><DisplayInformation>{n} implant</DisplayInformation>
+    <SubtypeConfig>
+      <ImplantSubtypeConfig><SupportFilename>b.stl</SupportFilename><DisplayInformation>TB-W_H4.0</DisplayInformation></ImplantSubtypeConfig>
+      <ImplantSubtypeConfig><SupportFilename>b.stl</SupportFilename><DisplayInformation>TB-W_H5.5</DisplayInformation></ImplantSubtypeConfig>
+    </SubtypeConfig>
+  </ImplantTypeConfig></TypeConfig>
+</ImplantLibraryEntry>"""
+    bodies = {"OneFlat": _revolve(2.0, 1.3, 10, -1), "Wide": _revolve(2.5, 1.7, 10, -1)}
+    for name, b in bodies.items():
+        d = tmp_path / name
+        d.mkdir()
+        save_stl(str(d / f"{name}.stl"), b)
+        save_stl(str(d / "analog.stl"), _revolve(2.0, None, 0, -12))  # file case differs from the config
+        (d / "config.xml").write_text(cfg.format(m=f"{name}.stl", n=name), encoding="utf-8")
+    entries, report = scan_library(str(tmp_path))
+    assert len(entries) == 2 and all(r["readable"] == 1 for r in report)
+    assert [s.height for s in entries[0].types[0].subtypes] == [4.0, 5.5]
+    # scan: the top of "OneFlat", tilted 8 degrees and moved
+    sb = bodies["OneFlat"]
+    part = sb.keep_faces((sb.vertices[sb.faces][:, :, 2] > 3).all(1))
+    a = np.radians(8)
+    R = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    t = np.array([4.0, 2.0, -1.0])
+    scan = merge_meshes([part])
+    wv = scan.vertices @ R.T + t
+    site = scan_site(wv, scan.faces, R @ [-2.0, 0, 8] + t, hint_up=R @ [0, 0, 1])
+    matches = identify(site, entries)
+    assert matches[0].entry.name == "OneFlat"
+    p_lib, a_lib = platform_in_library(matches[0].entry, matches[0].shape)
+    platform = matches[0].T[:3, :3] @ p_lib + matches[0].T[:3, 3]
+    axis = matches[0].T[:3, :3] @ a_lib
+    assert np.linalg.norm(platform - t) < 0.05
+    meas = measure(site, platform, axis, occlusal=[0, 0, 1])
+    assert abs(meas.angulation - 8) < 0.5
+    assert suggest(meas, Rules(), matches[0].entry).kind.startswith("Straight")

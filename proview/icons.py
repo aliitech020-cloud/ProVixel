@@ -52,6 +52,9 @@ _ICONS = {
                     f'<path d="M15 14.500v4.500M13 17l2 2 2-2" stroke="{RED}"/>',
     "sculpt_smooth": f'<path d="M3 15l2-2 2 2 2-2 2 2 2-2 2 2 2-2 2 2 2-2" stroke-opacity="0.45"/>'
                      f'<path d="M3 19c4-2 14-2 18 0" stroke="{ACCENT}" stroke-width="2"/>',
+    "implant": f'<path d="M9 2.5h6v6.5H9Z" stroke="{GREEN}"/><path d="M10.5 2.5v6.5" stroke="{GREEN}"/>'
+               '<path d="M8 11h8l-.6 2H8.6ZM8.4 14l7.2 1.2M8.6 16.4l6.8 1.2M9 18.8l6 1M10 21.2h4"/>'
+               f'<path d="M12 9v2" stroke="{ACCENT}"/>',
     "history": '<path d="M3.5 12a8.5 8.5 0 1 0 2.5-6"/><path d="M3 4.5V9h4.5"/>'
                f'<path d="M12 7.5V12l3 2" stroke="{ACCENT}"/>',
     "settings": '<circle cx="12" cy="12" r="3"/>'

@@ -84,6 +84,67 @@ def project_center(viewer, model):
     return project(viewer.ren, ((lo + hi) / 2)[None])[0, :2]
 
 
+def _selftest_implant(win, app, root):
+    import os
+
+    import numpy as np
+
+    from .mesh import Mesh, merge_meshes, save_stl
+    from .model import Model
+
+    def body(R, flat, top, bottom, nt=64, nz=40):
+        th = np.linspace(0, 2 * np.pi, nt, endpoint=False)
+        rings = []
+        for z in np.linspace(bottom, top, nz):
+            x, y = R * np.cos(th), R * np.sin(th)
+            if flat is not None and z > top - 4:
+                x = np.minimum(x, flat)
+            rings.append(np.column_stack([x, y, np.full(nt, z)]))
+        V = np.vstack(rings + [[[0, 0, bottom]], [[0, 0, top]]])
+        F = []
+        for k in range(nz - 1):
+            for i in range(nt):
+                a, b = k * nt + i, k * nt + (i + 1) % nt
+                F += [(a, b, a + nt), (b, b + nt, a + nt)]
+        for i in range(nt):
+            F += [(nz * nt, (i + 1) % nt, i), (nz * nt + 1, (nz - 1) * nt + i, (nz - 1) * nt + (i + 1) % nt)]
+        return Mesh(V, np.array(F))
+
+    lib = os.path.join(root, "Test")
+    os.makedirs(lib)
+    sb = body(2.0, 1.3, 10.0, -1.0)
+    save_stl(os.path.join(lib, "sb.stl"), sb)
+    save_stl(os.path.join(lib, "analog.stl"), body(2.0, None, 0.0, -12.0))
+    with open(os.path.join(lib, "config.xml"), "w", encoding="utf-8") as fh:
+        fh.write("<ImplantLibraryEntry><AxisOcclusal><x>0</x><y>0</y><z>1</z></AxisOcclusal>"
+                 "<MarkerFilename>sb.stl</MarkerFilename><DisplayInformation>Test</DisplayInformation>"
+                 "<TypeConfig><ImplantTypeConfig><ImplantFilename>analog.stl</ImplantFilename>"
+                 "<DisplayInformation>Test implant</DisplayInformation></ImplantTypeConfig></TypeConfig>"
+                 "</ImplantLibraryEntry>")
+    part = sb.keep_faces((sb.vertices[sb.faces][:, :, 2] > 3).all(1))
+    g = np.linspace(-8, 8, 41)
+    X, Y = np.meshgrid(g, g)
+    P = np.column_stack([X.ravel(), Y.ravel()])
+    P = P[np.hypot(*P.T) > 2.3]
+    from scipy.spatial import Delaunay
+
+    t = Delaunay(P).simplices
+    t = t[np.hypot(*P[t].mean(1).T) > 2.3]
+    gum = Mesh(np.column_stack([P, np.full(len(P), 3.0)]), t)
+    scan = merge_meshes([part, gum])
+    win.settings.setValue("implant/library", root)
+    win._add_model(Model("implant scan", scan))
+    m = win.viewer.models[-1]
+    win.model_list.setCurrentRow(len(win.viewer.models) - 1)
+    win.a_implant.setChecked(True)
+    ip = win.implant_panel
+    ip.occlusal_override = np.array([0.0, 0.0, 1.0])
+    ip.clicked(m, np.array([-2.0, 0.0, 8.0]))
+    assert ip.matches and ip.matches[0].score > 0.6, "implant: scan body not identified"
+    assert "Straight" in ip.result_lbl.text(), "implant: unexpected suggestion"
+    win.a_implant.setChecked(False)
+
+
 def run_selftest(win, app, out_png: str) -> None:
     """Exercise the main features, save a screenshot and quit (exit code 0 = ok)."""
     import numpy as np
@@ -251,6 +312,9 @@ def run_selftest(win, app, out_png: str) -> None:
         assert len(Case.load(path).steps) == 3
         win.close_case()
         log("selftest: cases ok")
+        # implant: a small library with one scan body, a scan of it, identify + suggest
+        _selftest_implant(win, app, tempfile.mkdtemp(prefix="provixel_lib_"))
+        log("selftest: implant ok")
         win.viewer.screenshot(out_png)
         log("selftest: PASSED")
         app.exit(0)

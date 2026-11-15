@@ -1,0 +1,464 @@
+"""Find the implant from a scanned scan body (or an implant hole) and suggest an abutment.
+
+1. Around the clicked point the scan body is measured as a cylinder: axis, radius, top.
+2. Library scan bodies of a similar radius are registered onto the scan (several turns about
+   the axis, then ICP); each gets a score from how well the scanned surface lies on it and how
+   much of its top is covered by the scan.
+3. The best match gives the implant: the analog of the library entry is in the same frame as
+   its scan body, its top is the implant platform.
+4. Angulation to the occlusal axis, gingival height around the implant and the room to the
+   opposing jaw lead to a suggestion (straight / angled, angle, GH, abutment height).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+from .alignment import FixedTarget, icp
+from .implant_lib import LibEntry, file_hash, load_geometry
+from .mesh import Mesh
+
+
+# ---------------------------------------------------------------------- cylinder geometry
+def _perp_basis(a):
+    a = a / np.linalg.norm(a)
+    t = np.cross(a, [1.0, 0.0, 0.0] if abs(a[0]) < 0.9 else [0.0, 1.0, 0.0])
+    t /= np.linalg.norm(t)
+    return t, np.cross(a, t)
+
+
+def _circle_fit(xy, w=None):
+    """Algebraic circle fit -> (centre, radius, rms residual)."""
+    if len(xy) < 3:
+        return np.zeros(2), 0.0, np.inf
+    w = np.ones(len(xy)) if w is None else w
+    A = np.column_stack([xy, np.ones(len(xy))]) * w[:, None]
+    b = (xy ** 2).sum(1) * w
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return np.zeros(2), 0.0, np.inf
+    c = sol[:2] / 2
+    r = float(np.sqrt(max(sol[2] + c @ c, 0.0)))
+    res = np.abs(np.linalg.norm(xy - c, axis=1) - r)
+    return c, r, float(np.sqrt(np.average(res ** 2, weights=w)))
+
+
+@dataclass
+class Cylinder:
+    axis: np.ndarray  # unit, towards the free end (top)
+    centre: np.ndarray  # a point on the axis
+    radius: float
+    top: float  # height of the top along the axis (axis @ point)
+    fit: float  # rms of the side fit (mm)
+
+    def height(self, pts):
+        return np.asarray(pts) @ self.axis
+
+    def radial(self, pts):
+        rel = np.asarray(pts) - self.centre
+        return np.linalg.norm(rel - np.outer(rel @ self.axis, self.axis), axis=1)
+
+
+def fit_cylinder(points, normals, areas, hint_up=None, candidates=None, inward=False) -> Cylinder | None:
+    """Cylinder through a patch of surface (points with normals): the side faces are the ones
+    perpendicular to the axis. ``inward``: a hole (normals point to the axis)."""
+    points, normals = np.asarray(points, float), np.asarray(normals, float)
+    w = np.asarray(areas, float)
+    M = (normals * w[:, None]).T @ normals
+    _, vecs = np.linalg.eigh(M)
+    axes = [vecs[:, k] for k in range(3)]
+    if hint_up is not None:
+        axes.append(np.asarray(hint_up, float))
+    if candidates:
+        axes += [np.asarray(c, float) for c in candidates]
+    best = None
+    for a in axes:
+        a = a / np.linalg.norm(a)
+        for _ in range(3):  # refine: the axis is perpendicular to the side normals
+            side = np.abs(normals @ a) < 0.3
+            if side.sum() < 10:
+                break
+            ns = normals[side]
+            Ms = (ns * w[side][:, None]).T @ ns
+            a_new = np.linalg.eigh(Ms)[1][:, 0]
+            a = a_new if a_new @ a >= 0 else -a_new
+        side = np.abs(normals @ a) < 0.3
+        if side.sum() < 10:
+            continue
+        t, u = _perp_basis(a)
+        xy = np.column_stack([points[side] @ t, points[side] @ u])
+        c, r, res = _circle_fit(xy, w[side])
+        if not (0.8 < r < 6.0):
+            continue
+        # normals must point away from (or, for a hole, towards) the axis
+        centre = c[0] * t + c[1] * u
+        rel = points[side] - centre
+        radial_dir = rel - np.outer(rel @ a, a)
+        radial_dir /= np.linalg.norm(radial_dir, axis=1, keepdims=True) + 1e-12
+        agree = float(np.average(np.einsum("ij,ij->i", radial_dir, normals[side]), weights=w[side]))
+        if (agree < 0.5 and not inward) or (agree > -0.5 and inward):
+            continue
+        area = float(w[side][np.abs(np.linalg.norm(xy - c, axis=1) - r) < 0.15].sum())
+        score = area * np.exp(-res / 0.08)
+        if best is None or score > best[0]:
+            best = (score, a, centre, r, res)
+    if best is None:
+        return None
+    _, a, centre, r, res = best
+    cyl = Cylinder(a, centre, r, 0.0, res)
+    rad = cyl.radial(points)
+    near = rad <= r + 0.3
+    far = rad > r + 1.0
+    h = cyl.height(points)
+    # the free end points away from the surrounding tissue (or, for a hole, the opening)
+    flip = False
+    if far.any() and near.any():
+        flip = h[near].mean() < h[far].mean() if not inward else h[near].mean() > h[far].mean()
+    elif hint_up is not None:
+        flip = a @ hint_up < 0
+    if flip:
+        cyl.axis = -a
+        h = -h
+    cyl.top = float(h[near].max()) if near.any() else float(h.max())
+    return cyl
+
+
+# ---------------------------------------------------------------------- library shapes
+@dataclass
+class MarkerShape:
+    """A library scan body ready for matching (in its library frame)."""
+
+    path: str
+    hash: str
+    points: np.ndarray
+    normals: np.ndarray
+    cyl: Cylinder
+    target: FixedTarget
+    top_pts: np.ndarray  # points of the top 2 mm (to check that the scan covers them)
+
+
+_SHAPES: dict = {}
+
+
+def marker_shape(entry: LibEntry) -> MarkerShape | None:
+    key = entry.marker
+    if key in _SHAPES:
+        return _SHAPES[key]
+    mesh = load_geometry(entry.marker)
+    shape = None
+    if mesh is not None:
+        fn = mesh.face_normals()
+        tri = mesh.vertices[mesh.faces]
+        areas = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) / 2
+        cen = tri.mean(1)
+        pts = np.vstack([mesh.vertices, cen])
+        nrm = np.vstack([mesh.vertex_normals(), fn])
+        axis = np.asarray(entry.axis, float)
+        axis /= np.linalg.norm(axis) or 1.0
+        # the scan body's own cylinder near its top (the part a scanner sees)
+        h = cen @ axis
+        upper = h > h.max() - 6.0
+        cyl = fit_cylinder(cen[upper], fn[upper], areas[upper], hint_up=axis, candidates=[axis])
+        if cyl is not None:
+            if cyl.axis @ axis < 0:
+                cyl.axis = -cyl.axis
+            cyl.top = float((pts @ cyl.axis).max())
+            hp = pts @ cyl.axis
+            shape = MarkerShape(entry.marker, file_hash(entry.marker), pts, nrm, cyl,
+                                FixedTarget(pts, nrm), pts[hp > cyl.top - 2.0])
+    _SHAPES[key] = shape
+    return shape
+
+
+def platform_in_library(entry: LibEntry, shape: MarkerShape, type_index: int = 0):
+    """(point, axis) of the implant platform in the library frame: top of the implant analog
+    (all files of an entry share one frame); without an analog, the frame origin on the axis."""
+    a = shape.cyl.axis
+    analog = None
+    if entry.types and 0 <= type_index < len(entry.types) and entry.types[type_index].analog:
+        analog = load_geometry(entry.types[type_index].analog)
+    if analog is not None:
+        hv = analog.vertices @ a
+        h_top = float(hv.max())
+        # centre of the analog's top (round), not of the scan body (often flattened on one side)
+        ring = analog.vertices[hv > h_top - 0.3]
+        c = ring.mean(0) if len(ring) >= 3 else shape.cyl.centre
+    else:
+        c = np.zeros(3)  # libraries put the implant on the frame origin
+        h_top = 0.0
+    return c + a * (h_top - c @ a), a
+
+
+# ---------------------------------------------------------------------- scan side
+@dataclass
+class ScanSite:
+    points: np.ndarray  # surface samples around the click (world)
+    normals: np.ndarray
+    cyl: Cylinder | None
+
+
+def scan_site(world_vertices, faces, click, radius=7.0, hint_up=None, inward=False) -> ScanSite:
+    v = np.asarray(world_vertices, float)
+    near_v = np.linalg.norm(v - click, axis=1) < radius
+    f = faces[near_v[faces].any(1)]
+    tri = v[f]
+    cr = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    areas = np.linalg.norm(cr, axis=1) / 2
+    fn = cr / (2 * areas[:, None] + 1e-12)
+    cen = tri.mean(1)
+    cyl = fit_cylinder(cen, fn, areas, hint_up=hint_up, inward=inward) if len(f) > 20 else None
+    return ScanSite(cen, fn, cyl)
+
+
+# ---------------------------------------------------------------------- matching
+@dataclass
+class Match:
+    entries: list  # LibEntry objects that share this scan body geometry
+    shape: MarkerShape
+    T: np.ndarray  # library frame -> world
+    rms: float
+    inliers: float  # share of scanned scan-body surface lying on the library shape
+    coverage: float  # share of the library top covered by the scan
+    score: float = 0.0
+
+    @property
+    def entry(self) -> LibEntry:
+        return self.entries[0]
+
+
+def _rot_to(a, b):
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    v = np.cross(a, b)
+    c = float(a @ b)
+    if c < -1 + 1e-9:
+        t, _ = _perp_basis(a)
+        return 2 * np.outer(t, t) - np.eye(3)
+    K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + K + K @ K / (1 + c)
+
+
+def _about(axis, ang):
+    axis = axis / np.linalg.norm(axis)
+    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    return np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * K @ K
+
+
+def _match_one(shape: MarkerShape, site: ScanSite) -> tuple[np.ndarray, float, float, float]:
+    """Best pose of the library shape on the scan: (T library->world, rms, inliers, coverage)."""
+    sc, mc = site.cyl, shape.cyl
+    zone = (sc.radial(site.points) <= sc.radius + 0.6) & (sc.height(site.points) >= sc.top - 9.0)
+    src = site.points[zone]
+    src_n = site.normals[zone]
+    if len(src) < 30:
+        return np.eye(4), np.inf, 0.0, 0.0
+    if len(src) > 4000:
+        idx = np.random.default_rng(0).choice(len(src), 4000, replace=False)
+        src, src_n = src[idx], src_n[idx]
+    R0 = _rot_to(mc.axis, sc.axis)
+    top_m = mc.centre + mc.axis * (mc.top - mc.centre @ mc.axis)
+    top_s = sc.centre + sc.axis * (sc.top - sc.centre @ sc.axis)
+    best = None
+    for k in range(12):  # unknown turn about the axis
+        R = _about(sc.axis, 2 * np.pi * k / 12) @ R0
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = top_s - R @ top_m
+        inv = np.linalg.inv(T)  # world -> library (ICP moves the scan onto the library shape)
+        res = icp(src, src_n, shape.target, init=inv, iterations=12, trim=0.85, max_distance=0.8)
+        if best is None or res.rms < best[1].rms or (res.rms == best[1].rms and res.inlier_fraction > best[1].inlier_fraction):
+            best = (k, res)
+    res = icp(src, src_n, shape.target, init=best[1].matrix, iterations=60, trim=0.9, max_distance=0.5)
+    W = res.matrix  # world -> library
+    p = (W[:3, :3] @ src.T).T + W[:3, 3]
+    d, _ = shape.target.tree.query(p)
+    inl = float((d < 0.1).mean())
+    rms = float(np.sqrt(np.mean(d[d < 0.2] ** 2))) if (d < 0.2).any() else float(np.sqrt(np.mean(d ** 2)))
+    # how much of the library top the scan covers
+    tree = cKDTree(p)
+    dc, _ = tree.query(shape.top_pts)
+    cov = float((dc < 0.15).mean())
+    return np.linalg.inv(W), rms, inl, cov
+
+
+def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, max_candidates=14) -> list[Match]:
+    """Library scan bodies ranked by how well they fit the scanned one (best first)."""
+    if site.cyl is None:
+        return []
+    groups: dict = {}
+    for e in entries:
+        shape = marker_shape(e)
+        if shape is None:
+            continue
+        groups.setdefault(shape.hash, (shape, []))[1].append(e)
+    cands = sorted(groups.values(), key=lambda g: abs(g[0].cyl.radius - site.cyl.radius))
+    cands = [g for g in cands if abs(g[0].cyl.radius - site.cyl.radius) < 0.45][:max_candidates]
+    out = []
+    for k, (shape, es) in enumerate(cands):
+        progress(f"Comparing {k + 1}/{len(cands)}: {es[0].title}")
+        T, rms, inl, cov = _match_one(shape, site)
+        if not np.isfinite(rms):
+            continue
+        score = inl * (0.4 + 0.6 * cov) * np.exp(-max(rms - 0.03, 0) / 0.08)
+        out.append(Match(es, shape, T, rms, inl, cov, float(score)))
+    out.sort(key=lambda m: -m.score)
+    return out
+
+
+def confidence(matches: list[Match]) -> str:
+    """'sure', 'likely' or 'unsure' for the best match."""
+    if not matches:
+        return "unsure"
+    best = matches[0].score
+    second = matches[1].score if len(matches) > 1 else 0.0
+    if best > 0.75 and best - second > 0.08:
+        return "sure"
+    if best > 0.55 and best - second > 0.03:
+        return "likely"
+    return "unsure"
+
+
+# ---------------------------------------------------------------------- measurements / suggestion
+@dataclass
+class Rules:
+    straight_max: float = 10.0  # up to this angulation a straight abutment is fine
+    angled: tuple = (15.0, 25.0)  # angled abutments that are available
+    margin_depth: float = 0.5  # crown margin below the gingiva (mm)
+    crown_min: float = 1.5  # room the crown needs above the abutment (mm)
+
+
+@dataclass
+class Measures:
+    platform: np.ndarray
+    axis: np.ndarray  # implant axis (towards occlusal)
+    occlusal: np.ndarray | None
+    angulation: float | None
+    gh_min: float | None
+    gh_max: float | None
+    gh_mean: float | None
+    space: float | None  # platform to the opposing jaw along the implant axis
+    approximate: bool = False
+    notes: list = field(default_factory=list)
+
+
+def ray_hit(origin, direction, vertices, faces, max_dist=40.0):
+    """Distance along a ray to the first triangle (or None)."""
+    v = np.asarray(vertices, float)
+    rel = v - origin
+    along = rel @ direction
+    perp = np.linalg.norm(rel - np.outer(along, direction), axis=1)
+    keep = (perp[faces] < 6.0).any(1) & (along[faces] > -1).any(1) & (along[faces] < max_dist).any(1)
+    tri = v[faces[keep]]
+    if not len(tri):
+        return None
+    e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
+    p = np.cross(direction, e2)
+    det = np.einsum("ij,ij->i", e1, p)
+    ok = np.abs(det) > 1e-12
+    inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+    t0 = origin - tri[:, 0]
+    u = np.einsum("ij,ij->i", t0, p) * inv
+    q = np.cross(t0, e1)
+    w = (q @ direction) * inv
+    t = np.einsum("ij,ij->i", e2, q) * inv
+    hit = ok & (u >= 0) & (w >= 0) & (u + w <= 1) & (t > 0.05)
+    return float(t[hit].min()) if hit.any() else None
+
+
+def measure(site: ScanSite, platform, axis, occlusal=None, opposing=(), radius=None, approximate=False) -> Measures:
+    """Angulation, gingival height around the implant and room to the opposing jaw."""
+    axis = axis / np.linalg.norm(axis)
+    m = Measures(np.asarray(platform, float), axis, None, None, None, None, None, None, approximate)
+    if occlusal is not None:
+        occ = np.asarray(occlusal, float)
+        occ = occ / np.linalg.norm(occ)
+        if occ @ axis < 0:
+            occ = -occ
+        m.occlusal = occ
+        m.angulation = float(np.degrees(np.arccos(np.clip(occ @ axis, -1, 1))))
+    # gingiva: the surface just around the scan body / implant, per sector around the axis
+    r = radius if radius is not None else (site.cyl.radius if site.cyl else 2.0)
+    rel = site.points - platform
+    h = rel @ axis
+    lat = rel - np.outer(h, axis)
+    dist = np.linalg.norm(lat, axis=1)
+    ring = (dist > r + 0.25) & (dist < r + 1.8) & (h > -2.0) & (h < 10.0) & (np.abs(site.normals @ axis) > 0.2)
+    if ring.sum() >= 8:
+        t, u = _perp_basis(axis)
+        ang = np.arctan2(lat[ring] @ u, lat[ring] @ t)
+        sector = ((ang + np.pi) / (2 * np.pi) * 12).astype(int) % 12
+        levels = [float(np.median(h[ring][sector == s])) for s in range(12) if (sector == s).sum() >= 2]
+        if levels:
+            m.gh_min, m.gh_max, m.gh_mean = min(levels), max(levels), float(np.mean(levels))
+            if len(levels) < 8:
+                m.notes.append("The gingiva around the implant is only partly scanned.")
+    else:
+        m.notes.append("No gingiva found around the implant.")
+    for verts, faces in opposing:
+        d = ray_hit(np.asarray(platform, float), axis, verts, faces)
+        if d is not None and (m.space is None or d < m.space):
+            m.space = d
+    return m
+
+
+@dataclass
+class Suggestion:
+    kind: str  # "Straight" / "Angled 15°" / ...
+    gh: float | None
+    height: float | None
+    height_choice: str | None  # matching ti-base of the library
+    lines: list
+
+
+def suggest(meas: Measures, rules: Rules, entry: LibEntry | None = None, type_index: int = 0) -> Suggestion:
+    lines = []
+    a = meas.angulation
+    if a is None:
+        kind = "Straight (angulation unknown)"
+        lines.append("Occlusal direction unknown: angulation not measured.")
+    elif a <= rules.straight_max:
+        kind = "Straight"
+        lines.append(f"Angulation {a:.1f}° ≤ {rules.straight_max:.0f}°: a straight abutment fits.")
+    elif entry is not None and entry.asc_max and a <= entry.asc_max:
+        kind = f"Ti-base with angled screw channel ({a:.0f}°)"
+        lines.append(f"Angulation {a:.1f}°: within the library's angled screw channel range "
+                     f"(up to {entry.asc_max:.0f}°).")
+    else:
+        best = min(rules.angled, key=lambda x: abs(x - a)) if rules.angled else None
+        kind = f"Angled {best:.0f}°" if best is not None else "Angled"
+        lines.append(f"Angulation {a:.1f}°: an angled abutment ({best:.0f}°) corrects the axis.")
+        if best is not None and abs(best - a) > 7:
+            lines.append(f"The nearest available angle differs by {abs(best - a):.0f}°: check the design.")
+    gh = None
+    if meas.gh_min is not None:
+        gh = max(0.5, round((meas.gh_min - rules.margin_depth) * 2) / 2)
+        lines.append(f"Gingiva {meas.gh_min:.1f}–{meas.gh_max:.1f} mm above the platform: GH ≈ {gh:.1f} mm "
+                     f"(margin {rules.margin_depth:.1f} mm below the lowest gingiva).")
+    height = None
+    choice = None
+    if meas.space is not None and gh is not None:
+        avail = meas.space - gh - rules.crown_min
+        height = max(avail, 0.0)
+        lines.append(f"Room to the opposing jaw {meas.space:.1f} mm: abutment above the margin ≤ "
+                     f"{height:.1f} mm (crown needs {rules.crown_min:.1f} mm).")
+        if entry is not None and entry.types:
+            subs = [s for s in entry.types[min(type_index, len(entry.types) - 1)].subtypes if s.height]
+            fit = [s for s in subs if s.height <= height]
+            if fit:
+                pick = max(fit, key=lambda s: s.height)
+                choice = pick.name
+                lines.append(f"Library ti-base: {pick.name} (height {pick.height:g} mm).")
+            elif subs:
+                pick = min(subs, key=lambda s: s.height)
+                choice = pick.name
+                lines.append(f"Even the lowest library ti-base ({pick.name}, {pick.height:g} mm) is higher "
+                             "than the room: shorten it or check the bite.")
+    elif meas.space is None:
+        lines.append("No opposing jaw found along the implant axis: height not suggested.")
+    if meas.approximate:
+        lines.append("Position from the implant hole: approximate, check it.")
+    lines += meas.notes
+    return Suggestion(kind, gh, height, choice, lines)
