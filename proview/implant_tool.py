@@ -431,6 +431,16 @@ class ImplantPanel(QWidget):
                 return
             self.matches = identify(self.site, entries,
                                     lambda t: (self.status(t), QApplication.processEvents()), index=self.index)
+            try:
+                from .diagnostics import log
+
+                c = self.site.cyl
+                tilt = float(np.degrees(np.arccos(np.clip(abs(c.axis @ self.occlusal), 0, 1))))
+                log(f"implant: click {np.round(point, 2)} cylinder r={c.radius:.2f} fit={c.fit * 1000:.0f}um "
+                    f"tilt={tilt:.1f}deg flipped={c.flipped} points={len(self.site.points)} | " +
+                    "; ".join(f"{m.entry.library}/{m.score:.2f}/{m.rms * 1000:.0f}um" for m in self.matches[:3]))
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             QApplication.restoreOverrideCursor()
         self._fill_results()

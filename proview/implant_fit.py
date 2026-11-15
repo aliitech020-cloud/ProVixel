@@ -63,7 +63,8 @@ class Cylinder:
         return np.linalg.norm(rel - np.outer(rel @ self.axis, self.axis), axis=1)
 
 
-def fit_cylinder(points, normals, areas, hint_up=None, candidates=None, inward=False) -> Cylinder | None:
+def fit_cylinder(points, normals, areas, hint_up=None, candidates=None, inward=False,
+                 max_tilt: float | None = None) -> Cylinder | None:
     """Cylinder through a patch of surface (points with normals): the side faces are the ones
     perpendicular to the axis. ``inward``: a hole (normals point to the axis)."""
     points, normals = np.asarray(points, float), np.asarray(normals, float)
@@ -76,6 +77,7 @@ def fit_cylinder(points, normals, areas, hint_up=None, candidates=None, inward=F
     if candidates:
         axes += [np.asarray(c, float) for c in candidates]
     best = None
+    hint = None if hint_up is None else np.asarray(hint_up, float) / np.linalg.norm(hint_up)
     for a in axes:
         a = a / np.linalg.norm(a)
         for _ in range(3):  # refine: the axis is perpendicular to the side normals
@@ -89,6 +91,8 @@ def fit_cylinder(points, normals, areas, hint_up=None, candidates=None, inward=F
         side = np.abs(normals @ a) < 0.3
         if side.sum() < 10:
             continue
+        if hint is not None and max_tilt is not None and abs(a @ hint) < np.cos(np.radians(max_tilt)):
+            continue  # a scan body / implant is never far from the occlusal direction (e.g. the ridge)
         t, u = _perp_basis(a)
         xy = np.column_stack([points[side] @ t, points[side] @ u])
         c, r, res = _circle_fit(xy, w[side])
@@ -300,10 +304,36 @@ class ScanSite:
     cyl: Cylinder | None
 
 
+def _smooth_region(faces, fn, seed, max_angle=20.0):
+    """Faces reachable from ``seed`` without crossing an edge sharper than ``max_angle`` degrees
+    (the scan body wall ends at its top edge and where it meets the gingiva)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    m = len(faces)
+    e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    fid = np.tile(np.arange(m), 3)
+    key = np.sort(e, 1)
+    order = np.lexsort((key[:, 1], key[:, 0]))
+    ks, fs = key[order], fid[order]
+    same = np.all(ks[1:] == ks[:-1], axis=1)
+    a, b = fs[:-1][same], fs[1:][same]
+    smooth = np.einsum("ij,ij->i", fn[a], fn[b]) > np.cos(np.radians(max_angle))
+    a, b = a[smooth], b[smooth]
+    g = coo_matrix((np.ones(len(a)), (a, b)), shape=(m, m))
+    _, lab = connected_components(g, directed=False)
+    return lab == lab[seed]
+
+
 def scan_site(world_vertices, faces, click, radius=7.0, hint_up=None, inward=False) -> ScanSite:
-    """Surface around the click and the cylinder (scan body or hole) found in it. Several sizes
-    of the surrounding area are tried (a small one when neighbouring teeth are close)."""
+    """Surface around the click and the cylinder (scan body or hole) found in it.
+
+    The wall under the click is found first (smooth surface grown from the clicked triangle up to
+    sharp edges), so the round alveolar ridge or a neighbouring tooth is not taken for the scan
+    body; without a usable wall the whole neighbourhood is searched, also in a smaller and a larger
+    area. Axes far from the occlusal direction are not accepted."""
     v = np.asarray(world_vertices, float)
+    click = np.asarray(click, float)
     best = None
     for rad in (radius, 4.5, 10.0):
         near_v = np.linalg.norm(v - click, axis=1) < rad
@@ -315,11 +345,24 @@ def scan_site(world_vertices, faces, click, radius=7.0, hint_up=None, inward=Fal
         areas = np.linalg.norm(cr, axis=1) / 2
         fn = cr / (2 * areas[:, None] + 1e-12)
         cen = tri.mean(1)
-        cyl = fit_cylinder(cen, fn, areas, hint_up=hint_up, inward=inward)
+        cyl = None
+        seed = int(np.argmin(np.linalg.norm(cen - click, axis=1)))
+        wall = _smooth_region(f, fn, seed)
+        if wall.sum() >= 30:
+            cyl = fit_cylinder(cen[wall], fn[wall], areas[wall], hint_up=hint_up, inward=inward, max_tilt=45)
+            if cyl is not None:
+                # top (or bottom of a hole) from all the surface around the axis
+                rad_all = cyl.radial(cen)
+                h_all = cen @ cyl.axis
+                ring = rad_all <= cyl.radius + 0.3
+                if ring.any():
+                    cyl.top = float(h_all[ring].max())
+        if cyl is None:
+            cyl = fit_cylinder(cen, fn, areas, hint_up=hint_up, inward=inward, max_tilt=45)
         if cyl is None:
             continue
         # the cylinder must pass near the click (not a neighbouring tooth)
-        if abs(cyl.radial(np.asarray(click, float)[None])[0] - cyl.radius) > 1.0 and not inward:
+        if abs(cyl.radial(click[None])[0] - cyl.radius) > 1.0 and not inward:
             continue
         if cyl.flipped:
             fn = -fn  # work with outward normals from here on
