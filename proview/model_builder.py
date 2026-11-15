@@ -312,6 +312,22 @@ def build_model(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> M
             raise BuildError("The trimmed scan has no open edge.")
         main = max(loops, key=lambda lp: _loop_length(v, lp))
 
+    if opts.base_level is not None and turned and opts.base_level > v[:, 2].min() - 0.3:
+        # the base plane was pulled into the scan: the scan is cut flat just above it
+        progress("Cutting the scan at the base plane")
+        z_cut = float(opts.base_level) + 0.4  # edge smoothing lowers the edge a little
+        if z_cut >= v[:, 2].max() - 0.5:
+            raise BuildError("The base plane is above the teeth. Move it back.")
+        cut = remove_dangling_faces(_clip_above(Mesh(v, scan.faces), z_cut))
+        if cut.n_faces == 0:
+            raise BuildError("Nothing is left above the base plane. Move it back.")
+        scan = split_parts(cut, min_share=0.0, min_faces=1)[0]
+        v = scan.vertices
+        loops = boundary_loops(scan.faces)
+        if not loops:
+            raise BuildError("The scan has no open edge after the cut at the base plane.")
+        main = max(loops, key=lambda lp: _loop_length(v, lp))
+
     progress("Closing small holes")
     mesh, _, _ = fill_holes(scan, None, keep=main)
     mesh = Mesh(mesh.vertices, mesh.faces)
@@ -324,7 +340,7 @@ def build_model(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> M
         mesh = smooth_open_edge(mesh, main, opts.edge_smooth)
     z0 = float(mesh.vertices[:, 2].min()) - opts.base_height
     if opts.base_level is not None and turned:  # the base plane was placed by the user
-        z0 = min(float(opts.base_level), float(mesh.vertices[:, 2].min()) - 0.3)
+        z0 = min(float(opts.base_level), float(mesh.vertices[:, 2].min()) - 0.05)
 
     # ---------------- outer solid: scan + vertical walls down to z0
     progress("Building the base")

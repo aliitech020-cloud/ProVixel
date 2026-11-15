@@ -339,7 +339,7 @@ class BuilderPanel(QWidget):
         self.trim_off.setEnabled(self.trim.isChecked())
         self.trim_off.valueChanged.connect(lambda _v: self._changed())
         self.auto.toggled.connect(lambda on: self._auto_toggled(on))
-        self.base = _spin(self._saved("base"), 0.5, 40, 0.5)
+        self.base = _spin(self._saved("base"), -30, 40, 0.5)
         form.addRow(tr("builder_base"), self.base)
         self.edge = _spin(self._saved("edge"), 0.0, 10, 0.5)
         form.addRow(tr("builder_edge"), self.edge)

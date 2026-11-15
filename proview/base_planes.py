@@ -21,7 +21,7 @@ from .model_builder import (
     rotation_to_z,
 )
 
-MIN_BASE = 0.5
+MIN_BASE = -30.0  # negative: the plane is inside the scan, which is cut there
 MAX_BASE = 40.0
 
 
@@ -97,7 +97,11 @@ def make_jaws(models, cache: JawCache, auto: bool, view_up, trim: bool, trim_off
         n = acc / (np.linalg.norm(acc) or 1.0)
         ups = [n if d @ n >= 0 else -n for d in detected]
     else:
-        ups = [np.array([0.0, 0.0, 1.0])] * len(infos)
+        z = np.array([0.0, 0.0, 1.0])
+        if len(infos) == 1:
+            ups = [z]
+        else:  # the model's own Z axis, but the upper jaw keeps its teeth pointing down
+            ups = [z if d @ z >= 0 else -z for d in detected]
     jaws = []
     for (m, (v, main, _d)), up in zip(infos, ups):
         R = rotation_to_z(up)
@@ -128,6 +132,10 @@ def _polydata(points, polys=None, lines=None):
 
     def cells(arr):
         ca = vtkCellArray()
+        if isinstance(arr, np.ndarray) and arr.ndim == 2:  # many cells of one size: no Python loop
+            flat = np.hstack([np.full((len(arr), 1), arr.shape[1]), arr]).astype(np.int64).ravel()
+            ca.SetCells(len(arr), numpy_to_vtkIdTypeArray(flat, deep=True))
+            return ca
         flat = []
         for c in arr:
             flat.append(len(c))
@@ -149,6 +157,7 @@ class BasePlanes:
     PLANE = (0.2, 0.75, 0.85)
     PLANE_HOT = (0.35, 0.9, 1.0)
     BASE = (0.95, 0.75, 0.35)
+    CUT = (0.9, 0.12, 0.1)
     TRIM = (1.0, 0.55, 0.15)
 
     def __init__(self, viewer, on_drag=None, on_release=None):
@@ -207,7 +216,7 @@ class BasePlanes:
                 self.actors.append(self._actor(_polydata(t, [[0, 1, 2, 3]]), self.TRIM, 0.18))
             if show_bases:
                 n = len(j.xy)
-                top = np.column_stack([j.xy, j.top])
+                top = np.column_stack([j.xy, np.maximum(j.top, z)])  # plane inside: no walls above it
                 bottom = np.column_stack([j.xy, np.full(n, z)])
                 pts = j.to_world(np.vstack([top, bottom]))
                 i = np.arange(n)
@@ -220,9 +229,30 @@ class BasePlanes:
                                                        self.BASE, 0.25))
                 except Exception:  # noqa: BLE001 - the cap is only a hint
                     pass
+        for j in self.jaws:  # the part of the scan the plane cuts away is shown red
+            red = self._cut_part(j)
+            if red is not None:
+                a = self._actor(red, self.CUT, 1.0)
+                a.GetMapper().SetResolveCoincidentTopologyToPolygonOffset()
+                a.GetMapper().SetRelativeCoincidentTopologyPolygonOffsetParameters(-2, -2)
+                self.actors.append(a)
         for a in self.actors:
             ren.AddActor(a)
         self.viewer.render()
+
+    def _cut_part(self, j):
+        m = j.model
+        if not m.visible:
+            return None
+        wv, cen, _ = m.world_geometry()
+        below = (cen @ j.up) < j.level
+        if not below.any():
+            return None
+        f = m.mesh.faces[below]
+        used = np.unique(f)
+        remap = np.zeros(len(wv), np.int64)
+        remap[used] = np.arange(len(used))
+        return _polydata(wv[used], remap[f])
 
     def hide(self):
         for a in self.actors:
