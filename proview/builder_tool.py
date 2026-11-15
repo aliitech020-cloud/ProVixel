@@ -374,7 +374,7 @@ class BuilderPanel(QWidget):
         self._update_dir_label()
 
         self.go = QPushButton(tr("builder_go"))
-        self.go.setStyleSheet("QPushButton { background:#2c6ed5; color:white; font-weight:bold; padding:8px; }")
+        self.go.setProperty("primary", True)
         self.go.clicked.connect(lambda _=False: self.build())
         bl.addWidget(self.go)
         lay.addWidget(box)

@@ -172,7 +172,7 @@ class SurveyPanel(QWidget):
         lay.addWidget(help_lbl)
 
         b = QPushButton(tr("survey_from_view"))
-        b.setStyleSheet("QPushButton { background:#2c6ed5; color:white; font-weight:bold; padding:8px; }")
+        b.setProperty("primary", True)
         b.setToolTip(tr("survey_from_view_tip"))
         b.clicked.connect(lambda _=False: self.c.set_from_view())
         lay.addWidget(b)

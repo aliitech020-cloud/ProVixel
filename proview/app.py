@@ -14,8 +14,12 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QMainWindow,
+    QFrame,
+    QHBoxLayout,
+    QMenu,
     QMessageBox,
     QScrollArea,
+    QVBoxLayout,
     QSizePolicy,
     QStackedWidget,
     QToolBar,
@@ -40,18 +44,6 @@ from .survey_tool import SurveyController, SurveyPanel
 from .viewer import Viewer
 
 UNDO_LIMIT = 30
-
-TOOLBAR_STYLE = """
-QToolBar#actionBar { background:#1b1d22; border:none; border-bottom:1px solid #0f1013; padding:6px 10px; spacing:6px; }
-QToolBar#actionBar QToolButton { color:#e6e8ec; border:1px solid transparent; border-radius:7px; padding:4px; }
-QToolBar#actionBar QToolButton:hover { background:#2a2e36; border-color:#3a404b; }
-QToolBar#actionBar QToolButton[tile="true"] { background:#25282f; border:1px solid #30343c; border-radius:9px;
-    min-width:66px; max-width:66px; min-height:58px; font-size:11px; padding:5px 2px 4px 2px; }
-QToolBar#actionBar QToolButton[tile="true"]:hover { background:#2f343e; border-color:#4a90e2; }
-QToolBar#actionBar QToolButton[tile="true"]:checked { background:#1d3a5e; border:1px solid #4aa3ff; }
-QToolBar#actionBar QToolButton[tile="true"]:pressed { background:#173050; }
-"""
-
 
 class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings):
@@ -91,9 +83,6 @@ class MainWindow(QMainWindow):
         self._case_timer = QTimer(self)
         self._case_timer.setSingleShot(True)
         self._case_timer.timeout.connect(lambda: self._case_flush())
-        self.save_lbl = QLabel("")
-        self.save_lbl.setStyleSheet("color: #9aa0a6; padding: 0 8px;")
-        self.statusBar().addPermanentWidget(self.save_lbl)
         self._update_case_ui()
 
     # ================================================================ UI
@@ -224,42 +213,85 @@ class MainWindow(QMainWindow):
         mh.addAction(a_help)
         mh.addAction(self._act(tr("about"), self._about))
 
-        # action bar: file buttons on the left, big tool tiles centred
+        # top bar: case + file actions | tool groups | save state, help, settings
         tb = QToolBar("actions")
         tb.setObjectName("actionBar")
         tb.setMovable(False)
         tb.setFloatable(False)
-        tb.setIconSize(QSize(26, 26))
-        tb.setStyleSheet(TOOLBAR_STYLE)
+        tb.setIconSize(QSize(22, 22))
         self.addToolBar(Qt.TopToolBarArea, tb)
-        left = [a_open, a_save, a_undo]
-        for a in left:
+        self.case_btn = QToolButton()
+        self.case_btn.setObjectName("caseButton")
+        self.case_btn.setIcon(icon("case"))
+        self.case_btn.setIconSize(QSize(22, 22))
+        self.case_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.case_btn.setPopupMode(QToolButton.InstantPopup)
+        self.case_btn.setMenu(mc)
+        self.case_btn.setMinimumWidth(190)
+        self.case_btn.setMaximumWidth(280)
+        tb.addWidget(self.case_btn)
+        gap = QWidget()
+        gap.setFixedWidth(8)
+        tb.addWidget(gap)
+        self.a_history_tb = self._act("History", lambda: self.case_history(), icon_name="history")
+        self.a_history_tb.setToolTip("History: the saved steps of the case (Ctrl+H)")
+        for a in (a_open, a_save, a_undo, self.a_history_tb):
             tb.addAction(a)
         tb.addWidget(self._spacer())
-        tiles = [
-            (self.a_align, tr("tile_align")),
-            (self.a_section, tr("tile_section")), (self.a_orient, tr("tile_orient")),
-            (self.a_repair, tr("tile_repair")),
-            (self.a_builder, tr("tile_builder")), (self.a_survey, tr("tile_survey")),
-            (a_merge, tr("tile_merge")),
+        groups = [
+            ("PREPARE", [(self.a_align, tr("tile_align")), (self.a_orient, tr("tile_orient")),
+                         (a_merge, tr("tile_merge"))]),
+            ("EDIT", [(self.a_repair, tr("tile_repair"))]),
+            ("ANALYZE", [(self.a_section, tr("tile_section")), (self.a_survey, tr("tile_survey"))]),
+            ("PRODUCE", [(self.a_builder, tr("tile_builder"))]),
         ]
         # view switches float under the navigation cube
         self.view_bar = ViewBar(self, self.viewer, [self.a_colors, self.a_flat, self.a_edges, a_fit])
-        for a, label in tiles:
-            btn = QToolButton()
-            btn.setDefaultAction(a)
-            btn.setText(label)
-            btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-            btn.setIconSize(QSize(28, 28))
-            btn.setProperty("tile", True)
-            a.changed.connect(lambda b=btn, t=label: b.setText(t))
-            tb.addWidget(btn)
+        for gi, (caption, tiles) in enumerate(groups):
+            if gi:
+                sep = QFrame()
+                sep.setProperty("groupSep", True)
+                sep.setFixedSize(1, 52)
+                tb.addWidget(sep)
+            box = QWidget()
+            v = QVBoxLayout(box)
+            v.setContentsMargins(4, 0, 4, 0)
+            v.setSpacing(2)
+            lbl = QLabel(caption)
+            lbl.setProperty("groupCaption", True)
+            lbl.setAlignment(Qt.AlignCenter)
+            v.addWidget(lbl)
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            for a, label in tiles:
+                btn = QToolButton()
+                btn.setDefaultAction(a)
+                btn.setText(label)
+                btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+                btn.setIconSize(QSize(26, 26))
+                btn.setProperty("tile", True)
+                a.changed.connect(lambda b=btn, t=label: b.setText(t))
+                row.addWidget(btn)
+            v.addLayout(row)
+            tb.addWidget(box)
         tb.addWidget(self._spacer())
+        self.save_lbl = QLabel("")
+        self.save_lbl.setObjectName("savePill")
+        self.save_lbl.setFixedHeight(24)
+        tb.addWidget(self.save_lbl)
+        gap = QWidget()
+        gap.setFixedWidth(6)
+        tb.addWidget(gap)
         tb.addAction(a_help)
-        # balance the left group so the tiles stay centred
-        pad = QWidget()
-        pad.setFixedWidth(2 * 40)
-        tb.addWidget(pad)
+        settings_btn = QToolButton()
+        settings_btn.setIcon(icon("settings"))
+        settings_btn.setToolTip("Settings")
+        settings_btn.setPopupMode(QToolButton.InstantPopup)
+        sm = QMenu(settings_btn)
+        sm.addAction(self.a_case_root)
+        sm.addAction(self._act(tr("about"), self._about))
+        settings_btn.setMenu(sm)
+        tb.addWidget(settings_btn)
 
     @staticmethod
     def _spacer():
@@ -889,7 +921,7 @@ class MainWindow(QMainWindow):
             return
         if label:
             self._case_label = label
-        self.save_lbl.setText("Saving...")
+        self._set_save_state("Saving...", "saving")
         self._case_timer.start(1200)
 
     def _model_state(self, m: Model) -> ModelState:
@@ -935,28 +967,40 @@ class MainWindow(QMainWindow):
                     case.cleanup()
             for m in self.viewer.models:
                 m.dirty = False
-            self.save_lbl.setText(f"Saved  ·  step {case.steps[-1]['n']}")
+            self._set_save_state(f"Saved · step {case.steps[-1]['n']}", "saved")
         except Exception as exc:  # noqa: BLE001
             import traceback
 
             from .diagnostics import log
 
             log("case save failed\n" + traceback.format_exc())
-            self.save_lbl.setText("Not saved!")
+            self._set_save_state("Not saved!", "error")
             self.statusBar().showMessage(f"Could not save the case: {exc}", 10000)
+
+    def _set_save_state(self, text, state):
+        from .theme import set_state
+
+        self.save_lbl.setText(text)
+        set_state(self.save_lbl, state)
 
     def _update_case_ui(self):
         c = self.case
         self.setWindowTitle(f"ProVixel - {c.info.title()}" if c else "ProVixel - Quick view")
+        if c is None:
+            self.case_btn.setText("Quick view\nNo case - click for cases")
+        else:
+            sub = " · ".join(x for x in (c.info.doctor, c.info.work_type, c.info.teeth and "Teeth " + c.info.teeth) if x)
+            self.case_btn.setText(f"{c.info.patient}\n{sub or c.info.date}")
+        self.a_history_tb.setEnabled(c is not None)
         for a in (self.a_case_info, self.a_case_history, self.a_case_folder, self.a_case_close):
             a.setEnabled(c is not None)
         self.a_case_save_as.setEnabled(c is None)
         if c is None:
-            self.save_lbl.setText("Quick view (not saved automatically)")
+            self._set_save_state("Quick view · not saved", "")
         elif c.steps:
-            self.save_lbl.setText(f"Saved  ·  step {c.steps[-1]['n']}")
+            self._set_save_state(f"Saved · step {c.steps[-1]['n']}", "saved")
         else:
-            self.save_lbl.setText("Case: " + c.info.title())
+            self._set_save_state("Case open", "saved")
 
     def _clear_scene(self):
         self._loading = True
@@ -1173,24 +1217,9 @@ def _scrolled(panel):
 
 
 def _apply_dark_theme(app: QApplication):
-    app.setStyle("Fusion")
-    pal = QPalette()
-    base = QColor(36, 39, 44)
-    pal.setColor(QPalette.Window, base)
-    pal.setColor(QPalette.WindowText, QColor(225, 225, 225))
-    pal.setColor(QPalette.Base, QColor(28, 30, 34))
-    pal.setColor(QPalette.AlternateBase, base)
-    pal.setColor(QPalette.ToolTipBase, QColor(30, 32, 36))
-    pal.setColor(QPalette.ToolTipText, QColor(230, 230, 230))
-    pal.setColor(QPalette.Text, QColor(225, 225, 225))
-    pal.setColor(QPalette.Button, QColor(52, 56, 64))
-    pal.setColor(QPalette.ButtonText, QColor(230, 230, 230))
-    pal.setColor(QPalette.Highlight, QColor(52, 120, 200))
-    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    pal.setColor(QPalette.Disabled, QPalette.Text, QColor(120, 120, 120))
-    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(120, 120, 120))
-    app.setPalette(pal)
-    app.setStyleSheet("QToolTip { border:1px solid #3a3f48; padding:4px; }")
+    from .theme import apply_theme
+
+    apply_theme(app)
 
 
 def main(argv=None):

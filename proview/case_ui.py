@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from .cases import WORK_TYPES, Case, CaseInfo, list_cases
 
-ACCENT = "#2c6ed5"
+ACCENT = "#4c8dff"
 
 
 def open_folder(path: str) -> None:
