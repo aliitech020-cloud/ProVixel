@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 )
 
 from .i18n import tr
-from .model_builder import BuildError, BuildOptions, base_frame, boundary_loops, build_models
+from .base_planes import BasePlanes, JawCache, make_jaws
+from .model_builder import BuildError, BuildOptions, boundary_loops, build_models
 from .repair import fill_holes, loop_size
 
 QUALITY = [("quality_fine", 0.15), ("quality_normal", 0.2), ("quality_fast", 0.3)]
@@ -32,67 +33,6 @@ DEFAULTS = dict(hole_max=10.0, auto=True, trim=True, trim_offset=0.0, base=3.0, 
                 wall=2.5, inner=5.0, honey=False, cell=6.0, rib=1.0, quality=0, live=True,
                 text_size=4.0, text_depth=0.5, text_mode=0)
 PREVIEW_VOXEL = 0.3  # the live preview is built at this (faster) detail
-
-
-class TrimPreview:
-    """Orange translucent plane showing where the scan will be trimmed / the base starts."""
-
-    def __init__(self, viewer):
-        from vtkmodules.vtkFiltersSources import vtkPlaneSource
-        from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
-
-        self.viewer = viewer
-        self.src = vtkPlaneSource()
-        mapper = vtkPolyDataMapper()
-        mapper.SetInputConnection(self.src.GetOutputPort())
-        self.actor = vtkActor()
-        self.actor.SetMapper(mapper)
-        p = self.actor.GetProperty()
-        p.SetColor(1.0, 0.55, 0.15)
-        p.SetOpacity(0.35)
-        p.SetLighting(False)
-        self.actor.PickableOff()
-        self.shown = False
-        self._cache = {}
-
-    def show(self, models, opts):
-        planes = []
-        for m in models:
-            key = (id(m.mesh), m.matrix.tobytes(), opts.auto_orient, opts.up)
-            if key not in self._cache:
-                scan = m.mesh.transformed(m.matrix)
-                try:
-                    R, main, _ = base_frame(scan, BuildOptions(auto_orient=opts.auto_orient, trim=False,
-                                                               up=opts.up))
-                except Exception:  # noqa: BLE001
-                    continue
-                vl = scan.vertices @ R.T
-                self._cache = {key: (R, vl[main][:, 2], vl.min(0), vl.max(0))}
-            R, edge_h, lo, hi = self._cache[key]
-            z = float(np.quantile(edge_h, 0.2)) + opts.trim_offset
-            pad = 0.08 * float(np.linalg.norm(hi[:2] - lo[:2]))
-            corners = np.array([[lo[0] - pad, lo[1] - pad, z], [hi[0] + pad, lo[1] - pad, z],
-                                [lo[0] - pad, hi[1] + pad, z]]) @ R  # back to world
-            planes.append(corners)
-            break  # one preview plane (the first selected model)
-        if not planes:
-            self.hide()
-            return
-        o, p1, p2 = planes[0]
-        self.src.SetOrigin(*o)
-        self.src.SetPoint1(*p1)
-        self.src.SetPoint2(*p2)
-        self.src.Modified()
-        if not self.shown:
-            self.viewer.ren.AddActor(self.actor)
-            self.shown = True
-        self.viewer.render()
-
-    def hide(self):
-        if self.shown:
-            self.viewer.ren.RemoveActor(self.actor)
-            self.shown = False
-            self.viewer.render()
 
 
 class ModelPreview:
@@ -119,7 +59,8 @@ class ModelPreview:
         self.result = None
 
     def request(self, models, opts, on_done):
-        """Start (or queue) a background build; on_done(text) is called on the GUI thread."""
+        """Start (or queue) a background build; ``opts``: one BuildOptions per model.
+        on_done(text) is called on the GUI thread."""
         self.gen += 1
         scans = [m.mesh.transformed(m.matrix) for m in models]
         job = (self.gen, models, scans, opts, on_done)
@@ -136,8 +77,8 @@ class ModelPreview:
         def work():
             try:
                 out = []
-                for scan in scans:
-                    out += build_models(scan, opts)
+                for scan, o in zip(scans, opts):
+                    out += build_models(scan, o)
                 self.result = (gen, models, out, None)
             except Exception as exc:  # noqa: BLE001
                 self.result = (gen, models, None, exc)
@@ -338,8 +279,12 @@ class BuilderPanel(QWidget):
                  parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.preview = TrimPreview(viewer) if viewer is not None else None
         self.model_preview = ModelPreview(viewer) if viewer is not None else None
+        self.planes = (BasePlanes(viewer, on_drag=lambda j: self._plane_dragged(j),
+                                  on_release=lambda j: self._plane_released(j)) if viewer is not None else None)
+        self.jaw_cache = JawCache()
+        self.jaws = []
+        self.bases = {}  # id(model) -> base height set by dragging its plane
         self.viewer = viewer
         self.view_up = None  # teeth direction taken from the view (world), None = auto
         self.placer = None
@@ -420,7 +365,9 @@ class BuilderPanel(QWidget):
         bl.addLayout(form)
         self.hollow.toggled.connect(lambda _on: (self._enable(), self._changed()))
         self.honey.toggled.connect(lambda _on: (self._enable(), self._changed()))
-        for sb in (self.base, self.edge, self.wall, self.inner, self.cell, self.rib):
+        self.base.setToolTip(tr("builder_base_tip"))
+        self.base.valueChanged.connect(lambda v: self._base_typed(v))
+        for sb in (self.edge, self.wall, self.inner, self.cell, self.rib):
             sb.valueChanged.connect(lambda _v: self._changed())
         self.quality.currentIndexChanged.connect(lambda _i: self._changed())
         self._enable()
@@ -496,13 +443,16 @@ class BuilderPanel(QWidget):
     def set_active(self, on):
         self.active = on
         if on:
+            self._use_planes_tool()
             self._schedule_preview()
         else:
-            if self.preview is not None:
-                self.preview.hide()
+            self.place_btn.setChecked(False)
+            if self.planes is not None:
+                self.planes.hide()
+                if self.viewer.style.tool is self.planes:
+                    self.viewer.style.tool = None
             if self.model_preview is not None:
                 self.model_preview.cancel()
-            self.place_btn.setChecked(False)
 
     def _schedule_preview(self, force=False):
         if self.active and (force or not getattr(self, "_just_built", False)):
@@ -518,18 +468,61 @@ class BuilderPanel(QWidget):
         self.refresh()
 
     def update_preview(self):
-        if self.preview is None or not self.active:
+        if self.planes is None or not self.active:
             return
         models = self.get_models()
-        if not models or not self.trim.isChecked():
-            self.preview.hide()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.jaws = make_jaws(models, self.jaw_cache, self.auto.isChecked(), self.view_up,
+                                  self.trim.isChecked(), self.trim_off.value(), self.bases, self.base.value())
+        except Exception:  # noqa: BLE001
+            import traceback
+
+            from .diagnostics import log
+
+            log("base planes failed\n" + traceback.format_exc())
+            self.jaws = []
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.planes.show_bases = not (self.model_preview is not None and self.model_preview.shown)
+        if self.jaws:
+            self.planes.show(self.jaws, self.planes.show_bases)
         else:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            try:
-                self.preview.show(models, self.options())
-            finally:
-                QApplication.restoreOverrideCursor()
+            self.planes.hide()
         self._update_model_preview(models)
+
+    def _use_planes_tool(self):
+        if self.planes is not None and self.viewer is not None and not self.place_btn.isChecked():
+            self.viewer.style.tool = self.planes
+
+    def _base_typed(self, value):
+        for j in self.jaws:
+            self.bases[id(j.model)] = value
+        self._changed()
+
+    def _plane_dragged(self, jaw):
+        self.bases[id(jaw.model)] = jaw.base
+        self.base.blockSignals(True)
+        self.base.setValue(jaw.base)
+        self.base.blockSignals(False)
+        if self.model_preview is not None and self.model_preview.shown:
+            self.model_preview.cancel()  # show the scan and the transparent base while dragging
+        self.planes.show_bases = True
+
+    def _plane_released(self, jaw):
+        self._plane_dragged(jaw)
+        self._changed()
+
+    def options_for(self, model) -> BuildOptions:
+        """Build options of one model: its base ends on its (dragged) base plane."""
+        opts = self.options()
+        for j in self.jaws:
+            if j.model is model:
+                opts.up = tuple(float(x) for x in j.up)
+                opts.base_height = j.base
+                opts.base_level = j.level
+                break
+        return opts
 
     def _update_model_preview(self, models):
         mp = self.model_preview
@@ -539,13 +532,17 @@ class BuilderPanel(QWidget):
         if not (self.live.isChecked() and models and self.active):
             mp.cancel()
             return
-        opts = self.options()
-        opts.voxel = max(opts.voxel, PREVIEW_VOXEL)
+        opts = [self.options_for(m) for m in models]
+        for o in opts:
+            o.voxel = max(o.voxel, PREVIEW_VOXEL)
         self.result_lbl.setText(tr("builder_preview_busy"))
 
         def done(error):
             if error is None:
                 self.result_lbl.setText(tr("builder_preview_ready"))
+                if self.planes is not None and self.planes.jaws:
+                    self.planes.show_bases = False  # the previewed model shows the base itself
+                    self.planes.show(self.planes.jaws, False)
             else:
                 self.result_lbl.setText(tr("builder_preview_failed", err=error) if error else "")
 
@@ -617,6 +614,8 @@ class BuilderPanel(QWidget):
                 self.placer.hide()
                 if self.viewer.style.tool is self.placer:
                     self.viewer.style.tool = None
+            if self.active:
+                self._use_planes_tool()
 
     def place_text(self, point, normal, up, model):
         """Put the text on ``model`` at the world point (called by the click tool)."""
@@ -698,10 +697,11 @@ class BuilderPanel(QWidget):
             QApplication.processEvents()
 
         self._save()
-        if self.preview is not None:
-            self.preview.hide()
+        if self.planes is not None:
+            self.planes.hide()
         if self.model_preview is not None:
             self.model_preview.cancel()
+        per_model = {id(m): self.options_for(m) for m in models}
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self.go.setEnabled(False)
@@ -711,7 +711,7 @@ class BuilderPanel(QWidget):
             for m in models:
                 scan = m.mesh.transformed(m.matrix)
                 prefix = f"{m.name}: " if len(models) > 1 else ""
-                results = build_models(scan, self.options(), lambda t, p=prefix: progress(p + t))
+                results = build_models(scan, per_model[id(m)], lambda t, p=prefix: progress(p + t))
                 for i, r in enumerate(results):
                     self.add_result(m, r, i + 1 if len(results) > 1 else None, made == 0)
                     made += 1

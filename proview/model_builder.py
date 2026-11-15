@@ -33,6 +33,7 @@ class BuildOptions:
     trim: bool = True  # cut the scan's edge flat (removes hanging tissue, undercut flaps)
     trim_offset: float = 0.0  # mm; 0 = automatic level, positive = cut higher
     up: tuple | None = None  # teeth direction in world space (e.g. set from the view); overrides auto
+    base_level: float | None = None  # base plane height along ``up`` (world); None = base_height below
 
 
 MAX_VOXELS = 40_000_000
@@ -322,6 +323,8 @@ def build_model(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> M
     if opts.edge_smooth > 0:
         mesh = smooth_open_edge(mesh, main, opts.edge_smooth)
     z0 = float(mesh.vertices[:, 2].min()) - opts.base_height
+    if opts.base_level is not None and turned:  # the base plane was placed by the user
+        z0 = min(float(opts.base_level), float(mesh.vertices[:, 2].min()) - 0.3)
 
     # ---------------- outer solid: scan + vertical walls down to z0
     progress("Building the base")
@@ -508,6 +511,11 @@ def split_parts(mesh: Mesh, min_share: float = 0.02, min_faces: int = 200) -> li
 def build_models(scan: Mesh, opts: BuildOptions, progress=lambda text: None) -> list[Mesh]:
     """One model per separate piece of the scan."""
     parts = split_parts(scan)
+    if len(parts) > 1 and opts.base_level is not None:
+        # upper and lower arch in one file: each part finds its own base (one plane can't serve both)
+        from dataclasses import replace
+
+        opts = replace(opts, base_level=None, up=None)
     out = []
     for i, part in enumerate(parts):
         prefix = f"Part {i + 1}/{len(parts)}: " if len(parts) > 1 else ""

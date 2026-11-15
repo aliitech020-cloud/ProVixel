@@ -79,7 +79,9 @@ _STRINGS = {
     "builder_help": ("Turns the selected scan(s) into printable models: the scan's open edge is extended "
                      "to a flat base. Optionally hollow (open base so resin can drain, smooth inside) and "
                      "reinforced with a honeycomb. Upper and lower jaws are detected automatically; several "
-                     "selected models or separate arches in one file each get their own model.",
+                     "selected models or separate arches in one file each get their own model. Select the upper and "
+                     "lower scan together (Ctrl+click) for parallel bases; drag a blue base plane to make that "
+                     "base taller or shorter.",
                      "يحوّل المسح المحدد إلى قالب قابل للطباعة."),
     "builder_base": ("Base height", "ارتفاع القاعدة"),
     "builder_hollow": ("Hollow model (open base)", "قالب مجوّف (قاعدة مفتوحة)"),
@@ -92,6 +94,9 @@ _STRINGS = {
     "quality_normal": ("Normal", "عادية"),
     "quality_fast": ("Fast", "سريعة"),
     "builder_go": ("Create model", "إنشاء القالب"),
+    "builder_base_tip": ("Height of the base below the trim level (or the lowest point of the scan). "
+                         "Drag the blue base plane in the view to set it for each jaw separately.",
+                         "ارتفاع القاعدة. اسحب المستوى الأزرق لكل فك."),
     "builder_live": ("Live preview (updates while you change the settings)", "معاينة مباشرة"),
     "builder_live_tip": ("The model is rebuilt in the background at a faster detail after every change "
                          "and shown in place of the scan. Create model builds it at the chosen quality.",
