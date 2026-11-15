@@ -140,6 +140,7 @@ class ImplantPanel(QWidget):
         self.status = status
         self.settings = settings
         self.entries = None  # library entries, read on first use
+        self.index = None
         self.library_root = None
         self.matches = []
         self.site = None
@@ -314,6 +315,11 @@ class ImplantPanel(QWidget):
             self.entries, self._report = scan_library(
                 root, lambda t: (self.status(t), QApplication.processEvents()))
             self.library_root = root
+            from .diagnostics import log_path
+            from .implant_fit import library_index
+
+            cache = os.path.join(os.path.dirname(log_path()), "implant_index.json")
+            self.index = library_index(self.entries, cache, lambda t: (self.status(t), QApplication.processEvents()))
         finally:
             QApplication.restoreOverrideCursor()
         self._update_lib_label()
@@ -424,7 +430,7 @@ class ImplantPanel(QWidget):
                                         "(e.g. ...\\DentalCADApp\\library\\implant) and check it.")
                 return
             self.matches = identify(self.site, entries,
-                                    lambda t: (self.status(t), QApplication.processEvents()))
+                                    lambda t: (self.status(t), QApplication.processEvents()), index=self.index)
         finally:
             QApplication.restoreOverrideCursor()
         self._fill_results()
@@ -491,6 +497,9 @@ class ImplantPanel(QWidget):
         axis = m.T[:3, :3] @ a_lib
         meas = measure(self.site, platform, axis, self.occlusal, self._opposing(),
                        radius=m.shape.cyl.radius)
+        if not e.types or not e.types[min(ti, len(e.types) - 1)].analog:
+            meas.notes.append("This library names no implant analog: the implant platform is taken at the library's "
+                              "origin. Check that the yellow ring sits on the implant.")
         sg = suggest(meas, self.rules(), e, ti)
         marker = load_geometry(e.marker)
         if marker is not None:

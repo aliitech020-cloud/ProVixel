@@ -53,6 +53,7 @@ class Cylinder:
     radius: float
     top: float  # height of the top along the axis (axis @ point)
     fit: float  # rms of the side fit (mm)
+    flipped: bool = False  # the surface's normals point inwards (mesh stored inside-out)
 
     def height(self, pts):
         return np.asarray(pts) @ self.axis
@@ -99,16 +100,18 @@ def fit_cylinder(points, normals, areas, hint_up=None, candidates=None, inward=F
         radial_dir = rel - np.outer(rel @ a, a)
         radial_dir /= np.linalg.norm(radial_dir, axis=1, keepdims=True) + 1e-12
         agree = float(np.average(np.einsum("ij,ij->i", radial_dir, normals[side]), weights=w[side]))
-        if (agree < 0.5 and not inward) or (agree > -0.5 and inward):
+        if abs(agree) < 0.5:  # not a round wall
             continue
+        # scans are often stored inside-out: then a scan body's normals point to the axis
+        flipped = (agree < 0) != inward
         area = float(w[side][np.abs(np.linalg.norm(xy - c, axis=1) - r) < 0.15].sum())
         score = area * np.exp(-res / 0.08)
         if best is None or score > best[0]:
-            best = (score, a, centre, r, res)
+            best = (score, a, centre, r, res, flipped)
     if best is None:
         return None
-    _, a, centre, r, res = best
-    cyl = Cylinder(a, centre, r, 0.0, res)
+    _, a, centre, r, res, flipped = best
+    cyl = Cylinder(a, centre, r, 0.0, res, flipped)
     rad = cyl.radial(points)
     near = rad <= r + 0.3
     far = rad > r + 1.0
@@ -126,6 +129,36 @@ def fit_cylinder(points, normals, areas, hint_up=None, candidates=None, inward=F
     return cyl
 
 
+# ---------------------------------------------------------------------- shape descriptor
+PROFILE_SLICES = np.arange(0.4, 7.0, 0.8)  # depths below the top (mm)
+
+
+def profile(points, normals, cyl: Cylinder) -> np.ndarray:
+    """Outer and inner radius of the side wall in slices below the top: [r90..., r10...]
+    (NaN where the slice has no surface, e.g. under the gingiva)."""
+    side = np.abs(normals @ cyl.axis) < 0.5
+    pts = points[side]
+    depth = cyl.top - cyl.height(pts)
+    rad = cyl.radial(pts)
+    hi, lo = [], []
+    for d in PROFILE_SLICES:
+        sel = np.abs(depth - d) < 0.4
+        if sel.sum() >= 6:
+            hi.append(np.percentile(rad[sel], 90))
+            lo.append(np.percentile(rad[sel], 10))
+        else:
+            hi.append(np.nan)
+            lo.append(np.nan)
+    return np.array(hi + lo)
+
+
+def profile_distance(a, b) -> float:
+    ok = np.isfinite(a) & np.isfinite(b)
+    if ok.sum() < 3:
+        return np.inf
+    return float(np.mean(np.abs(a[ok] - b[ok])))
+
+
 # ---------------------------------------------------------------------- library shapes
 @dataclass
 class MarkerShape:
@@ -138,6 +171,7 @@ class MarkerShape:
     cyl: Cylinder
     target: FixedTarget
     top_pts: np.ndarray  # points of the top 2 mm (to check that the scan covers them)
+    profile: np.ndarray | None = None
 
 
 _SHAPES: dict = {}
@@ -162,15 +196,81 @@ def marker_shape(entry: LibEntry) -> MarkerShape | None:
         h = cen @ axis
         upper = h > h.max() - 6.0
         cyl = fit_cylinder(cen[upper], fn[upper], areas[upper], hint_up=axis, candidates=[axis])
+        if cyl is not None and cyl.flipped:
+            nrm = -nrm
         if cyl is not None:
             if cyl.axis @ axis < 0:
                 cyl.axis = -cyl.axis
             cyl.top = float((pts @ cyl.axis).max())
             hp = pts @ cyl.axis
             shape = MarkerShape(entry.marker, file_hash(entry.marker), pts, nrm, cyl,
-                                FixedTarget(pts, nrm), pts[hp > cyl.top - 2.0])
+                                FixedTarget(pts, nrm), pts[hp > cyl.top - 2.0],
+                                profile(cen, fn if not cyl.flipped else -fn, cyl))
     _SHAPES[key] = shape
     return shape
+
+
+def describe_marker(path: str, axis) -> dict | None:
+    """Small description of a library scan body for fast pre-selection (no ICP data kept)."""
+    mesh = load_geometry(path)
+    if mesh is None:
+        return None
+    fn = mesh.face_normals()
+    tri = mesh.vertices[mesh.faces]
+    areas = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) / 2
+    cen = tri.mean(1)
+    a = np.asarray(axis, float)
+    a /= np.linalg.norm(a) or 1.0
+    h = cen @ a
+    upper = h > h.max() - 6.0
+    cyl = fit_cylinder(cen[upper], fn[upper], areas[upper], hint_up=a, candidates=[a])
+    if cyl is None:
+        return None
+    if cyl.axis @ a < 0:
+        cyl.axis = -cyl.axis
+    cyl.top = float((mesh.vertices @ cyl.axis).max())
+    prof = profile(cen, -fn if cyl.flipped else fn, cyl)
+    return {"hash": file_hash(path), "radius": cyl.radius, "profile": [None if not np.isfinite(x) else float(x)
+                                                                        for x in prof]}
+
+
+def library_index(entries: list[LibEntry], cache_file: str | None = None, progress=lambda t: None) -> dict:
+    """path -> description for every scan body; kept in a cache file between sessions."""
+    import json
+    import os
+
+    cache = {}
+    if cache_file and os.path.isfile(cache_file):
+        try:
+            with open(cache_file, encoding="utf-8") as fh:
+                cache = json.load(fh)
+        except (OSError, ValueError):
+            cache = {}
+    out, changed = {}, False
+    todo = sorted({e.marker: e for e in entries}.values(), key=lambda e: e.marker)
+    for k, e in enumerate(todo):
+        try:
+            st = os.stat(e.marker)
+        except OSError:
+            continue
+        key = f"{e.marker}|{st.st_size}|{int(st.st_mtime)}|v1"
+        if key not in cache:
+            if k % 10 == 0:
+                progress(f"Indexing the scan bodies {k + 1}/{len(todo)} (only the first time)")
+            cache[key] = describe_marker(e.marker, e.axis)
+            changed = True
+        d = cache[key]
+        if d is not None:
+            out[e.marker] = d
+    if changed and cache_file:
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(cache, fh)
+            os.replace(cache_file + ".tmp", cache_file)
+        except OSError:
+            pass
+    return out
 
 
 def platform_in_library(entry: LibEntry, shape: MarkerShape, type_index: int = 0):
@@ -201,16 +301,40 @@ class ScanSite:
 
 
 def scan_site(world_vertices, faces, click, radius=7.0, hint_up=None, inward=False) -> ScanSite:
+    """Surface around the click and the cylinder (scan body or hole) found in it. Several sizes
+    of the surrounding area are tried (a small one when neighbouring teeth are close)."""
     v = np.asarray(world_vertices, float)
-    near_v = np.linalg.norm(v - click, axis=1) < radius
-    f = faces[near_v[faces].any(1)]
-    tri = v[f]
-    cr = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-    areas = np.linalg.norm(cr, axis=1) / 2
-    fn = cr / (2 * areas[:, None] + 1e-12)
-    cen = tri.mean(1)
-    cyl = fit_cylinder(cen, fn, areas, hint_up=hint_up, inward=inward) if len(f) > 20 else None
-    return ScanSite(cen, fn, cyl)
+    best = None
+    for rad in (radius, 4.5, 10.0):
+        near_v = np.linalg.norm(v - click, axis=1) < rad
+        f = faces[near_v[faces].any(1)]
+        if len(f) <= 20:
+            continue
+        tri = v[f]
+        cr = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        areas = np.linalg.norm(cr, axis=1) / 2
+        fn = cr / (2 * areas[:, None] + 1e-12)
+        cen = tri.mean(1)
+        cyl = fit_cylinder(cen, fn, areas, hint_up=hint_up, inward=inward)
+        if cyl is None:
+            continue
+        # the cylinder must pass near the click (not a neighbouring tooth)
+        if abs(cyl.radial(np.asarray(click, float)[None])[0] - cyl.radius) > 1.0 and not inward:
+            continue
+        if cyl.flipped:
+            fn = -fn  # work with outward normals from here on
+        best = ScanSite(cen, fn, cyl)
+        break
+    if best is None:
+        try:
+            from .diagnostics import log
+
+            log(f"implant: no cylinder at {np.round(click, 2)} (faces near: "
+                f"{int((np.linalg.norm(v - click, axis=1) < radius).sum())} vertices)")
+        except Exception:  # noqa: BLE001
+            pass
+        return ScanSite(np.zeros((0, 3)), np.zeros((0, 3)), None)
+    return best
 
 
 # ---------------------------------------------------------------------- matching
@@ -284,21 +408,40 @@ def _match_one(shape: MarkerShape, site: ScanSite) -> tuple[np.ndarray, float, f
     return np.linalg.inv(W), rms, inl, cov
 
 
-def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, max_candidates=14) -> list[Match]:
+def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, max_candidates=16,
+             index: dict | None = None) -> list[Match]:
     """Library scan bodies ranked by how well they fit the scanned one (best first)."""
     if site.cyl is None:
         return []
+    sc = site.cyl
+    near = sc.radial(site.points) <= sc.radius + 1.0  # the scan body, not the gingiva around it
+    site_prof = profile(site.points[near], site.normals[near], sc)
+    if index is None:
+        index = library_index(entries, progress=progress)
     groups: dict = {}
     for e in entries:
-        shape = marker_shape(e)
+        d = index.get(e.marker)
+        if d is None:
+            continue
+        g = groups.setdefault(d["hash"], [d, []])
+        g[1].append(e)
+    ranked = []
+    for d, es in groups.values():
+        if abs(d["radius"] - sc.radius) > 0.6:
+            continue
+        prof = np.array([np.nan if x is None else x for x in d["profile"]], float)
+        dist = profile_distance(site_prof, prof)
+        if not np.isfinite(dist):
+            dist = abs(d["radius"] - sc.radius) + 1.0
+        ranked.append((dist, es))
+    ranked.sort(key=lambda r: r[0])
+    out = []
+    shortlist = ranked[:max_candidates]
+    for k, (dist, es) in enumerate(shortlist):
+        progress(f"Comparing {k + 1}/{len(shortlist)}: {es[0].title}")
+        shape = marker_shape(es[0])
         if shape is None:
             continue
-        groups.setdefault(shape.hash, (shape, []))[1].append(e)
-    cands = sorted(groups.values(), key=lambda g: abs(g[0].cyl.radius - site.cyl.radius))
-    cands = [g for g in cands if abs(g[0].cyl.radius - site.cyl.radius) < 0.45][:max_candidates]
-    out = []
-    for k, (shape, es) in enumerate(cands):
-        progress(f"Comparing {k + 1}/{len(cands)}: {es[0].title}")
         T, rms, inl, cov = _match_one(shape, site)
         if not np.isfinite(rms):
             continue
