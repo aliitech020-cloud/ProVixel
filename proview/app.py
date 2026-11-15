@@ -10,6 +10,7 @@ from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QLabel,
@@ -1034,7 +1035,7 @@ class MainWindow(QMainWindow):
 
         if info is None:
             dlg = CaseInfoDialog(self, title="Save as case" if from_scene else "New case")
-            if dlg.exec() != dlg.Accepted:
+            if dlg.exec() != QDialog.Accepted:
                 return False
             info = dlg.info()
         if not from_scene and not self._leave_current():
@@ -1064,7 +1065,7 @@ class MainWindow(QMainWindow):
 
         if path is None:
             dlg = CaseBrowser(self._cases_root(), self)
-            if dlg.exec() != dlg.Accepted:
+            if dlg.exec() != QDialog.Accepted:
                 return False
             if dlg.new_requested:
                 return self.new_case()
@@ -1130,7 +1131,7 @@ class MainWindow(QMainWindow):
         if self.case is None:
             return
         dlg = CaseInfoDialog(self, self.case.info, title="Case information")
-        if dlg.exec() != dlg.Accepted:
+        if dlg.exec() != QDialog.Accepted:
             return
         self.case.info = dlg.info()
         self.case.save()
@@ -1144,7 +1145,7 @@ class MainWindow(QMainWindow):
         self._case_flush(force=True)
         if restore is None:
             dlg = HistoryDialog(self.case, self)
-            if dlg.exec() != dlg.Accepted or dlg.chosen is None:
+            if dlg.exec() != QDialog.Accepted or dlg.chosen is None:
                 return
             restore = dlg.chosen
         try:

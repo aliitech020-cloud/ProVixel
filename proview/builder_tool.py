@@ -136,26 +136,41 @@ class ModelPreview:
 
 
 class TextPlacer:
-    """Viewer tool: shows the text outline under the cursor; a click puts it on the model."""
+    """Viewer tool: shows the text under the cursor, filled and on top of the model, laid on the
+    surface; a click puts it on the model."""
 
     def __init__(self, panel):
-        from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
+        from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkRenderer
 
         self.panel = panel
         self.viewer = panel.viewer
-        self.mapper = vtkPolyDataMapper()
-        self.actor = vtkActor()
-        self.actor.SetMapper(self.mapper)
-        p = self.actor.GetProperty()
-        p.SetColor(1.0, 0.45, 0.1)
-        p.SetLineWidth(2)
+        # own layer with the viewer's camera: the preview is never hidden inside the model
+        self.ren = vtkRenderer()
+        self.ren.SetLayer(1)
+        self.ren.InteractiveOff()
+        self.ren.SetActiveCamera(self.viewer.ren.GetActiveCamera())
+        self.ren.AddObserver("StartEvent", lambda *a: self.ren.ResetCameraClippingRange())
+        self.fill_mapper = vtkPolyDataMapper()
+        self.fill = vtkActor()
+        self.fill.SetMapper(self.fill_mapper)
+        p = self.fill.GetProperty()
+        p.SetColor(1.0, 0.55, 0.15)
+        p.SetOpacity(0.75)
         p.SetLighting(False)
-        self.actor.PickableOff()
-        self.mapper.SetResolveCoincidentTopologyToPolygonOffset()
-        self.mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-4, -4)
+        self.line_mapper = vtkPolyDataMapper()
+        self.lines = vtkActor()
+        self.lines.SetMapper(self.line_mapper)
+        p = self.lines.GetProperty()
+        p.SetColor(1.0, 0.92, 0.75)
+        p.SetLineWidth(1.5)
+        p.SetLighting(False)
+        for a in (self.fill, self.lines):
+            a.PickableOff()
+            self.ren.AddActor(a)
         self.shown = False
         self._outline_key = None
         self._outlines = []
+        self._glyphs = None  # filled letters: (vertices x/y, triangles)
         self.hit = None
 
     def _frame_at(self, x, y):
@@ -177,31 +192,43 @@ class TextPlacer:
             n = -n
         return best[1], n, np.array(cam.GetViewUp(), float), best[3]
 
-    def _draw(self, point, normal, up, model=None):
-        from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
-        from vtkmodules.vtkCommonCore import vtkPoints
-        from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
-
-        from .text_label import text_frame, text_outlines
+    def _shapes(self):
+        from .model_builder import _triangulate_planar_loops
+        from .text_label import text_outlines
 
         key = (self.panel.text.text(), self.panel.text_size.value())
         if key != self._outline_key:
             self._outline_key = key
+            self._glyphs = None
             try:
-                self._outlines = text_outlines(*key)
+                self._outlines = [o for o in text_outlines(*key) if len(o) >= 3]
             except Exception:  # noqa: BLE001
                 self._outlines = []
-        if not self._outlines:
+            if self._outlines:
+                try:
+                    cap = _triangulate_planar_loops(self._outlines, 0.0)
+                    if cap.n_faces:
+                        self._glyphs = (cap.vertices[:, :2], cap.faces)
+                except Exception:  # noqa: BLE001 - the outline alone is shown then
+                    self._glyphs = None
+        return self._outlines, self._glyphs
+
+    def _draw(self, point, normal, up, model=None):
+        from .base_planes import _polydata
+        from .text_label import text_frame
+
+        outlines, glyphs = self._shapes()
+        if not outlines:
             self.hide()
             return
         right, up, n = text_frame(normal, up)
         surf = None
-        if model is not None:  # lay the outline on the surface (it is curved): height along n of
+        if model is not None:  # lay the text on the surface (it is curved): height along n of
             # the front-facing surface nearest in the text plane
             from scipy.spatial import cKDTree
 
             wv, _, fn = model.world_geometry()
-            ext = max(max(np.abs(o).max() for o in self._outlines) + 1.0, 2.0)
+            ext = max(max(np.abs(o).max() for o in outlines) + 1.0, 2.0)
             rel = wv - point
             near = np.abs(rel @ right) < ext
             near &= np.abs(rel @ up) < ext
@@ -211,33 +238,35 @@ class TextPlacer:
             vid = np.unique(f[front])
             if len(vid) >= 3:
                 surf = (cKDTree(np.stack([rel[vid] @ right, rel[vid] @ up], 1)), rel[vid] @ n)
-        pts, cells, k = [], [], 0
-        for poly in self._outlines:
-            q = point + poly[:, :1] * right + poly[:, 1:] * up
+
+        def to3d(uv):
+            q = point + uv[:, :1] * right + uv[:, 1:] * up
             if surf is not None:
-                _, idx = surf[0].query(poly)
+                _, idx = surf[0].query(uv)
                 q = q + surf[1][idx][:, None] * n
-            q = q + 0.08 * n
-            q = np.vstack([q, q[:1]])
+            return q + 0.1 * n
+
+        pts, cells, k = [], [], 0
+        for poly in outlines:
+            q = to3d(poly)
             pts.append(q)
-            cells.append(np.concatenate([[len(q)], np.arange(k, k + len(q))]))
+            cells.append(list(range(k, k + len(q))) + [k])
             k += len(q)
-        vp = vtkPoints()
-        vp.SetData(numpy_to_vtk(np.vstack(pts), deep=True))
-        ca = vtkCellArray()
-        ca.SetCells(len(cells), numpy_to_vtkIdTypeArray(np.concatenate(cells).astype(np.int64), deep=True))
-        pd = vtkPolyData()
-        pd.SetPoints(vp)
-        pd.SetLines(ca)
-        self.mapper.SetInputData(pd)
+        self.line_mapper.SetInputData(_polydata(np.vstack(pts), lines=cells))
+        if glyphs is not None:
+            self.fill_mapper.SetInputData(_polydata(to3d(glyphs[0]), glyphs[1]))
+            self.fill.SetVisibility(True)
+        else:
+            self.fill.SetVisibility(False)
         if not self.shown:
-            self.viewer.ren.AddActor(self.actor)
+            self.viewer.rw.SetNumberOfLayers(max(2, self.viewer.rw.GetNumberOfLayers()))
+            self.viewer.rw.AddRenderer(self.ren)
             self.shown = True
         self.viewer.render()
 
     def hide(self):
         if self.shown:
-            self.viewer.ren.RemoveActor(self.actor)
+            self.viewer.rw.RemoveRenderer(self.ren)
             self.shown = False
             self.viewer.render()
 
