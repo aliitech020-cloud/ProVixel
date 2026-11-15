@@ -183,14 +183,14 @@ class TextPlacer:
             wv, _, fn = m.world_geometry()
             h = pick_mesh(self.viewer.ren, x, y, wv, m.mesh.faces)
             if h is not None and (best is None or h[0] < best[0]):
-                best = (h[0], h[1], fn[h[2]], m)
+                best = (h[0], h[1], fn[h[2]], m, int(h[2]))
         if best is None:
             return None
         cam = self.viewer.ren.GetActiveCamera()
         n = np.asarray(best[2], float)
         if n @ (np.array(cam.GetPosition(), float) - best[1]) < 0:  # scans can face inwards: towards the viewer
             n = -n
-        return best[1], n, np.array(cam.GetViewUp(), float), best[3]
+        return best[1], n, np.array(cam.GetViewUp(), float), best[3], best[4]
 
     def _shapes(self):
         from .model_builder import _triangulate_planar_loops
@@ -276,7 +276,7 @@ class TextPlacer:
         if self.hit is None:
             self.hide()
             return False
-        self._draw(*self.hit)
+        self._draw(*self.hit[:4])
         return False
 
     def on_press(self, x, y, ctrl, shift, rep):
@@ -646,7 +646,7 @@ class BuilderPanel(QWidget):
             if self.active:
                 self._use_planes_tool()
 
-    def place_text(self, point, normal, up, model):
+    def place_text(self, point, normal, up, model, face=None):
         """Put the text on ``model`` at the world point (called by the click tool)."""
         from .mesh import transform_points
         from .text_label import TextError, apply_text
@@ -663,7 +663,7 @@ class BuilderPanel(QWidget):
         try:
             mesh = apply_text(model.mesh, p, n, u, self.text.text(), self.text_size.value(), depth,
                               progress=lambda t: (self.status(f"{tr('text_title')}: {t}..."),
-                                                  QApplication.processEvents()))
+                                                  QApplication.processEvents()), face=face)
         except TextError as exc:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, tr("text_title"), str(exc))

@@ -12,7 +12,7 @@ from scipy.interpolate import LinearNDInterpolator
 
 from .mesh import Mesh
 
-MARGIN = 1.2  # mm of surface kept flat around the letters
+MARGIN = 1.0  # mm of surface kept flat around the letters
 
 
 class TextError(Exception):
@@ -122,47 +122,36 @@ def _inside_polygon(pts: np.ndarray, poly: np.ndarray) -> np.ndarray:
     return (cond & (x < xc)).sum(1) % 2 == 1
 
 
-def apply_text(mesh: Mesh, point, normal, up_hint, text: str, height: float = 4.0, depth: float = -0.5,
-               family: str | None = None, progress=lambda t: None) -> Mesh:
-    """Engrave (depth < 0) or emboss (depth > 0) ``text`` on ``mesh`` at ``point``.
+class _NoFit(Exception):
+    def __init__(self, lost: float):
+        super().__init__(f"{lost:.0%} of the text is off the surface")
+        self.lost = lost
 
-    ``normal`` is the outward surface normal there and ``up_hint`` the direction of the top of
-    the letters (usually the screen's up direction). All in the mesh's own coordinates."""
-    from .fuse import fuse_pair
+
+def _layout(mesh, fn, p, right, up, n, side, text, height, depth, family, h, tw, th, hit_face=None):
+    """Lettering grid for the label centred at ``p`` -> (grid mesh, replaced face ids).
+    Raises _NoFit when part of the text would be off the surface."""
     from .model_builder import boundary_loops
     from .section import SegmentSet
 
-    text = text.strip()
-    if not text:
-        raise TextError("Type a text first.")
-    p = np.asarray(point, float)
-    right, up, n = text_frame(normal, up_hint)
-    h = float(np.clip(height / 40.0, 0.04, 0.12))  # grid step: ~40 samples over the letter height
-    tw, th = text_size(text, height, family)
-    if tw <= 0 or th <= 0:
-        raise TextError("The text is empty.")
     W, H = tw + 2 * MARGIN, th + 2 * MARGIN
-
-    progress("Finding the surface under the text")
     v = mesh.vertices
     rel = v - p
     u_, v_, w_ = rel @ right, rel @ up, rel @ n
     reach = max(3.0, abs(depth) * 4)
     in_box = (np.abs(u_) <= W / 2 + 2 * h) & (np.abs(v_) <= H / 2 + 2 * h) & (np.abs(w_) <= reach)
-    fn = mesh.face_normals()
-    # faces turned towards the label (scans can be stored inside-out: use the clicked face's side)
-    i_near = int(np.argmin(np.linalg.norm(mesh.face_centroids() - p, axis=1)))
-    side = 1.0 if fn[i_near] @ n >= 0 else -1.0
     cand = in_box[mesh.faces].any(1) & (side * (fn @ n) > 0.15)
     if cand.sum() < 4:
-        raise TextError("No surface facing you here. Click on a smooth part of the model.")
-    # the connected piece of surface under the clicked point
+        raise _NoFit(1.0)
+    # the connected piece of surface under the label
     sub = mesh.keep_faces(cand)
     count, labels = sub.connected_components()
-    sv = sub.vertices - p
-    centre_face = int(np.argmin(np.linalg.norm(sub.face_centroids() - p, axis=1)))
-    piece = labels == labels[centre_face]
-    sub_idx = np.flatnonzero(cand)[piece]
+    cand_idx = np.flatnonzero(cand)
+    if hit_face is not None and cand[hit_face]:
+        centre_face = int(np.searchsorted(cand_idx, hit_face))
+    else:
+        centre_face = int(np.argmin(np.linalg.norm(sub.face_centroids() - p, axis=1)))
+    sub_idx = cand_idx[labels == labels[centre_face]]
     patch = mesh.keep_faces(np.isin(np.arange(mesh.n_faces), sub_idx))
     loops = boundary_loops(patch.faces)
     if not loops:
@@ -176,11 +165,8 @@ def apply_text(mesh: Mesh, point, normal, up_hint, text: str, height: float = 4.
     need = max(-poly[:, 0].min() - tw / 2, poly[:, 0].max() - tw / 2,
                -poly[:, 1].min() - th / 2, poly[:, 1].max() - th / 2)
     margin = float(np.clip(need + h, MARGIN, 30.0))
-    progress("Drawing the text")
     cov, W, H = text_coverage(text, height, h, margin=margin, family=family)
     nv, nu = cov.shape
-
-    progress("Building the lettering")
     gu = -W / 2 + np.arange(nu) * h
     gv = H / 2 - np.arange(nv) * h  # row 0 = top of the text
     GU, GV = np.meshgrid(gu, gv)
@@ -189,17 +175,16 @@ def apply_text(mesh: Mesh, point, normal, up_hint, text: str, height: float = 4.
     segs = np.stack([poly, np.roll(poly, -1, 0)], 1)
     dist, _ = SegmentSet(segs).nearest(pts2)
     inside &= dist > 0.75 * h
-    interp = LinearNDInterpolator(np.stack([pu, pv], 1), pw)
     w = np.full(len(pts2), np.nan)
-    w[inside] = interp(pts2[inside])
+    if inside.any():
+        w[inside] = LinearNDInterpolator(np.stack([pu, pv], 1), pw)(pts2[inside])
     valid = np.isfinite(w)
     ink = cov.ravel()
-    lost = ink[~valid].sum()
     if ink.sum() == 0:
         raise TextError("The text is empty.")
-    if lost > 0.02 * ink.sum():
-        raise TextError("The text does not fit on this part of the surface. Use a smaller text size "
-                        "or click on a larger, flatter area.")
+    lost = float(ink[~valid].sum() / ink.sum())
+    if lost > 0.02:
+        raise _NoFit(lost)
     w = np.where(valid, w + depth * ink, 0.0)
     grid3 = p + GU.ravel()[:, None] * right + GV.ravel()[:, None] * up + w[:, None] * n
     ok = valid.reshape(nv, nu)
@@ -212,6 +197,59 @@ def apply_text(mesh: Mesh, point, normal, up_hint, text: str, height: float = 4.
     cnt, lab = grid.connected_components()
     if cnt > 1:
         grid = grid.keep_faces(lab == np.bincount(lab).argmax())
+    return grid, sub_idx
+
+
+def apply_text(mesh: Mesh, point, normal, up_hint, text: str, height: float = 4.0, depth: float = -0.5,
+               family: str | None = None, progress=lambda t: None, face: int | None = None) -> Mesh:
+    """Engrave (depth < 0) or emboss (depth > 0) ``text`` on ``mesh`` at ``point``.
+
+    ``normal`` is the surface normal there towards the viewer, ``up_hint`` the direction of the top
+    of the letters (usually the screen's up direction) and ``face`` the clicked triangle. All in the
+    mesh's own coordinates. When the label does not fit at the point (e.g. close to the edge of a
+    base) it is moved onto the surface, as little as needed."""
+    from .fuse import fuse_pair
+
+    text = text.strip()
+    if not text:
+        raise TextError("Type a text first.")
+    p = np.asarray(point, float)
+    right, up, n = text_frame(normal, up_hint)
+    h = float(np.clip(height / 40.0, 0.04, 0.12))  # grid step: ~40 samples over the letter height
+    tw, th = text_size(text, height, family)
+    if tw <= 0 or th <= 0:
+        raise TextError("The text is empty.")
+    fn = mesh.face_normals()
+    # side of the surface the label goes on (scans can be stored inside-out): the clicked triangle's
+    if face is None:
+        face = int(np.argmin(np.linalg.norm(mesh.face_centroids() - p, axis=1)))
+    side = 1.0 if fn[face] @ n >= 0 else -1.0
+
+    progress("Finding room for the text")
+    # first the clicked point, then positions moved along the surface, nearest first
+    dv_max, du_max = th / 2 + MARGIN, tw / 2
+    steps = []
+    for dv in np.arange(0.0, dv_max + 1e-6, 0.5):
+        for du in np.arange(0.0, du_max + 1e-6, 1.0):
+            for sv in ((1, -1) if dv else (1,)):
+                for su in ((1, -1) if du else (1,)):
+                    steps.append((float(np.hypot(du, dv)), su * du, sv * dv))
+    steps.sort()
+    result = None
+    best_lost = 1.0
+    for k, (_dist, du, dv) in enumerate(steps[:40]):
+        q = p + du * right + dv * up
+        try:
+            result = _layout(mesh, fn, q, right, up, n, side, text, height, depth, family, h, tw, th,
+                             hit_face=face)
+            break
+        except _NoFit as exc:
+            best_lost = min(best_lost, exc.lost)
+            continue
+    if result is None:
+        raise TextError("The text does not fit on this part of the surface. Use a smaller text size "
+                        "or click on a larger, flatter area.")
+    grid, sub_idx = result
     if mesh.colors is not None:
         from scipy.spatial import cKDTree
 

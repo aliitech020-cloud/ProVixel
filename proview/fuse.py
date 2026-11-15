@@ -42,7 +42,17 @@ def _has_edge(faces: np.ndarray, a: int, b: int) -> bool:
                        ((faces[:, 2] == a) & (faces[:, 0] == b))))
 
 
-def _zipper(P: np.ndarray, Q: np.ndarray, pv: np.ndarray, qv: np.ndarray) -> list[tuple[int, int, int]]:
+def _monotone(q: np.ndarray, n: int) -> np.ndarray:
+    """Positions along a loop of n points: unwrapped across the loop's start, never going back."""
+    q = np.asarray(q, float).copy()
+    d = np.diff(q)
+    d[d < -n / 2] += n
+    d[d > n / 2] -= n
+    q = q[0] + np.concatenate([[0.0], np.cumsum(d)])
+    return np.maximum.accumulate(q)
+
+
+def _zipper(P: np.ndarray, Q: np.ndarray, pv: np.ndarray, qv: np.ndarray, qpar=None) -> list[tuple[int, int, int]]:
     """Triangle strip between two polylines that run the same way (vertex ids P, Q; points pv, qv).
 
     P must be an edge loop as stored by ``boundary_loops`` of its surface (a->b in its faces)
@@ -55,7 +65,11 @@ def _zipper(P: np.ndarray, Q: np.ndarray, pv: np.ndarray, qv: np.ndarray) -> lis
         c = np.concatenate([[0.0], np.cumsum(seg)])
         return c / c[-1] if c[-1] > 0 else np.linspace(0, 1, len(pts))
 
-    fp, fq = frac(pv), frac(qv)
+    if qpar is not None:  # where each Q point lies along P (index units): exact pairing
+        fp = np.arange(n, dtype=float)
+        fq = np.asarray(qpar, float)
+    else:
+        fp, fq = frac(pv), frac(qv)
     i = j = 0
     while i < n - 1 or j < m - 1:
         # advance along the edge whose next point comes first (both edges run side by side,
@@ -149,15 +163,41 @@ def fuse_pair(base: Mesh, insert: Mesh, gap: float = 1.0, progress=lambda text: 
     return out, joined
 
 
-def _short_faces(faces, allv, limit: float) -> list:
-    """The triangles of a joining strip that bridge at most ``limit``; longer ones (where the
-    edges part) are left out, so the scans stay open there."""
+def _dist_to_polyline(pts: np.ndarray, line: np.ndarray) -> np.ndarray:
+    """Distance from each point to the nearest segment of an open polyline (3D)."""
+    if len(line) < 2:
+        return np.linalg.norm(pts - line[:1], axis=1) if len(line) else np.full(len(pts), np.inf)
+    a, b = line[:-1], line[1:]
+    tree = cKDTree((a + b) / 2)
+    k = min(8, len(a))
+    _, cand = tree.query(pts, k=k)
+    cand = np.asarray(cand).reshape(len(pts), k)
+    a0, ab = a[cand], b[cand] - a[cand]
+    den = np.einsum("nkj,nkj->nk", ab, ab)
+    den[den == 0] = 1.0
+    t = np.clip(np.einsum("nkj,nkj->nk", pts[:, None] - a0, ab) / den, 0, 1)
+    return np.linalg.norm(a0 + ab * t[..., None] - pts[:, None], axis=2).min(1)
+
+
+def _short_faces(faces, allv, limit: float, P=None, Q=None) -> list:
+    """The triangles of a joining strip whose corners all lie within ``limit`` of the other
+    surface's edge line; elsewhere (where the edges part) the strip is left open. Thin fans
+    along a long edge (e.g. the tall triangles of a model's base wall) are kept."""
     if not faces:
         return []
-    t = allv[np.asarray(faces)]
-    edges = np.linalg.norm(t - np.roll(t, 1, axis=1), axis=2)
-    keep = edges.max(1) <= limit
-    return [f for f, k in zip(faces, keep) if k]
+    f = np.asarray(faces)
+    if P is None or Q is None:
+        t = allv[f]
+        far = np.linalg.norm(t - np.roll(t, 1, axis=1), axis=2).max(1)
+    else:
+        d = {}
+        for ids, other in ((np.asarray(P), np.asarray(Q)), (np.asarray(Q), np.asarray(P))):
+            dist = _dist_to_polyline(allv[ids], allv[other])
+            for v_id, dv in zip(ids.tolist(), dist.tolist()):
+                d[v_id] = min(dv, d.get(v_id, np.inf))
+        far = np.array([max(d.get(int(x), 0.0) for x in face) for face in f])
+    keep = far <= limit
+    return [tuple(x) for x, k in zip(faces, keep) if k]
 
 
 def _join(a: Mesh, b: Mesh, gap: float, region=None):
@@ -183,7 +223,30 @@ def _join(a: Mesh, b: Mesh, gap: float, region=None):
     if not a_ok.any():
         return 0, []
     sel = np.flatnonzero(a_ok)
-    a_tree = cKDTree(av[a_ids[sel]])
+    # a's boundary as segments (start vertex -> next vertex of its loop): points are matched to the
+    # nearest segment, not the nearest vertex, so long edges (e.g. a base wall) are found too
+    nxt = np.concatenate([np.roll(np.asarray(lp), -1) for lp in a_loops])
+    seg_a, seg_b = av[a_ids[sel]], av[nxt[sel]]
+    seg_tree = cKDTree((seg_a + seg_b) / 2)
+    seg_half = float(np.linalg.norm(seg_b - seg_a, axis=1).max()) / 2 if len(sel) else 0.0
+
+    def nearest_seg(pts):
+        """(distance, index into sel) of the nearest a-boundary segment for each point."""
+        kk = min(16, len(sel))
+        _, cand = seg_tree.query(pts, k=kk, distance_upper_bound=reach + seg_half + 1e-9)
+        cand = np.asarray(cand).reshape(len(pts), kk)
+        valid = cand < len(sel)
+        cs = np.where(valid, cand, 0)
+        a0, ab = seg_a[cs], seg_b[cs] - seg_a[cs]
+        den = np.einsum("nkj,nkj->nk", ab, ab)
+        den[den == 0] = 1.0
+        t = np.clip(np.einsum("nkj,nkj->nk", pts[:, None] - a0, ab) / den, 0, 1)
+        d = np.linalg.norm(a0 + ab * t[..., None] - pts[:, None], axis=2)
+        d[~valid] = np.inf
+        best = np.argmin(d, 1)
+        rows = np.arange(len(pts))
+        return d[rows, best], cs[rows, best], t[rows, best]
+
     off = a.n_vertices
     allv = np.vstack([av, bv])
     limit = 2.0 * reach + 0.5
@@ -193,8 +256,8 @@ def _join(a: Mesh, b: Mesh, gap: float, region=None):
     plans = []
     for blp in b_loops:
         Q = np.asarray(blp)[::-1]  # reversed: runs the same way round as a's facing edge
-        dq, k = a_tree.query(bv[Q], distance_upper_bound=reach)
-        ok = np.isfinite(dq)
+        dq, k, tq = nearest_seg(bv[Q])
+        ok = dq <= reach
         if region_tree is not None:
             ok &= region_tree.query(bv[Q], distance_upper_bound=1.0)[0] < np.inf
         if ok.sum() < 3:
@@ -209,37 +272,41 @@ def _join(a: Mesh, b: Mesh, gap: float, region=None):
         near = np.abs(steps) <= max(2, n_a // 8)
         votes_same += np.sum(near & (steps > 0))
         votes_other += np.sum(near & (steps < 0))
-        plans.append((Q, ok, P_full, pos))
+        plans.append((Q, ok, P_full, pos + tq))
     if votes_other > votes_same:
         return -1, []
-    for Q, ok, P_full, pos in plans:
+    for Q, ok, P_full, par in plans:
         n = len(P_full)
         if ok.all():  # the whole edge loop meets one edge loop of the other scan: close the ring
-            k0 = int(np.argmin(np.linalg.norm(av[P_full] - bv[Q[0]], axis=1)))
+            k0 = int(np.floor(par[0])) % n
             P = np.roll(P_full, -k0)
-            ring = _zipper(np.append(P, P[0]), np.append(Q, Q[0]) + off,
-                           av[np.append(P, P[0])], bv[np.append(Q, Q[0])])
-            short = _short_faces(ring, allv, limit)
-            if len(short) > 0.9 * len(ring):
-                faces += short
-                joined += len(Q)
-                continue
+            qp = _monotone((par - k0) % n, n)
+            if qp[-1] - qp[0] < n:
+                P_ext = np.append(P, P[0])
+                Q_ext = np.append(Q, Q[0])
+                qp_ext = np.append(qp, qp[0] + n)
+                ring = _zipper(P_ext, Q_ext + off, av[P_ext], bv[Q_ext], qp_ext)
+                short = _short_faces(ring, allv, limit, P_ext, Q_ext + off)
+                if len(short) > 0.9 * len(ring):
+                    faces += short
+                    joined += len(Q)
+                    continue
         for s, e in _runs(ok, False):
             qi = np.arange(s, s + ((e - s) % len(Q)) + 1) % len(Q)
             # split where the matching point on a's edge jumps (the edges part and meet again)
-            p = pos[qi]
-            step = (np.diff(p) + n // 2) % n - n // 2  # signed step along a's loop
+            step = (np.diff(par[qi]) + n / 2) % n - n / 2  # signed step along a's loop
             cuts = np.flatnonzero((step < -2) | (step > 20)) + 1
             for part in np.split(qi, cuts):
                 if len(part) < 3:
                     continue
-                p0, p1 = pos[part[0]], pos[part[-1]]
-                span = (p1 - p0) % n
-                if span == 0 or span > 4 * len(part) + 20:
+                p0 = int(np.floor(par[part[0]])) % n
+                qp = _monotone((par[part] - p0) % n, n)
+                span = int(np.ceil(qp[-1]))
+                if span == 0 or span > 4 * len(part) + 20 or span >= n:
                     continue
                 P = P_full[(p0 + np.arange(span + 1)) % n]
-                strip = _zipper(P, Q[part] + off, av[P], bv[Q[part]])
-                short = _short_faces(strip, allv, limit)
+                strip = _zipper(P, Q[part] + off, av[P], bv[Q[part]], qp)
+                short = _short_faces(strip, allv, limit, P, Q[part] + off)
                 if len(short) >= 2:
                     faces += short
                     joined += len(part)

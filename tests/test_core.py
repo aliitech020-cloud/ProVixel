@@ -425,3 +425,30 @@ def test_case_steps_roundtrip(tmp_path):
     assert np.allclose(again.load_state_mesh(again.step_states()[0]).vertices, v * 2)  # copy in the case
     assert again.info.patient == "أحمد علي"
     assert [c.path for c in list_cases(str(tmp_path / "cases"))] == [case.path]
+
+
+def test_text_on_base_wall_near_edge():
+    """Text clicked close to the bottom of a built model's base moves up to fit; model stays closed."""
+    from PySide6.QtGui import QGuiApplication
+
+    from proview.model_builder import BuildOptions, boundary_loops, build_model
+    from proview.text_label import apply_text
+
+    _app = QGuiApplication.instance() or QGuiApplication([])  # noqa: F841
+    g = np.linspace(-10, 10, 41)
+    X, Y = np.meshgrid(g, g, indexing="ij")
+    Z = 6 + 2 * np.cos(X / 3) * np.cos(Y / 3) - 0.04 * (X ** 2 + Y ** 2)
+    sv = np.stack([X, Y, Z], -1).reshape(-1, 3)
+    sf = [(q, q + 41, q + 1) for i in range(40) for j in range(40) for q in [i * 41 + j]]
+    sf += [(q + 1, q + 41, q + 42) for i in range(40) for j in range(40) for q in [i * 41 + j]]
+    m = build_model(Mesh(sv, np.array(sf)), BuildOptions(voxel=0.4, base_height=6, trim=False, hollow=True,
+                                                          auto_orient=False))
+    z0 = m.vertices[:, 2].min()
+    fn, c = m.face_normals(), m.face_centroids()
+    cand = np.flatnonzero((fn[:, 0] < -0.9) & (np.abs(c[:, 1]) < 3) & (c[:, 2] < z0 + 5))
+    k = cand[np.argmin(c[cand, 0])]
+    p = c[k].copy()
+    p[2] = z0 + 0.5  # too low for the label: it has to move up
+    out = apply_text(m, p, fn[k], [0, 0, 1], "AB 12", 3.0, -0.5, face=int(k))
+    assert not boundary_loops(out.faces)
+    assert out.connected_components()[0] == 1
