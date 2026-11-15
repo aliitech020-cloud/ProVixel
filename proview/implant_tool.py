@@ -133,6 +133,91 @@ class Overlay:
         self.viewer.render()
 
 
+class Wave:
+    """A light wave that runs from the click over the scan body, then pulses while searching."""
+
+    SPEED = 16.0  # mm per second
+    GLOW = (0.25, 0.85, 1.0)
+
+    def __init__(self, viewer):
+        from PySide6.QtCore import QTimer
+
+        self.viewer = viewer
+        self.actor = None
+        self.timer = QTimer()
+        self.timer.setInterval(30)
+        self.timer.timeout.connect(lambda: self._frame())
+        self.t0 = 0.0
+        self.fading = None
+
+    def start(self, tris, click, base_color):
+        import time
+
+        from vtkmodules.util.numpy_support import numpy_to_vtk
+        from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
+
+        from .base_planes import _polydata
+
+        self.stop()
+        tris = np.asarray(tris, float)
+        pts = tris.reshape(-1, 3)
+        pd = _polydata(pts, np.arange(len(pts)).reshape(-1, 3))
+        self.dist = np.linalg.norm(tris.mean(1) - click, axis=1)
+        self.base = np.asarray(base_color, float)
+        self.colors = np.zeros((len(tris), 3), np.uint8)
+        self.vtk_colors = numpy_to_vtk(self.colors, deep=False)
+        pd.GetCellData().SetScalars(self.vtk_colors)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(pd)
+        mapper.SetColorModeToDirectScalars()
+        mapper.SetResolveCoincidentTopologyToPolygonOffset()
+        mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2, -2)
+        self.actor = vtkActor()
+        self.actor.SetMapper(mapper)
+        self.actor.PickableOff()
+        self.viewer.ren.AddActor(self.actor)
+        self.t0 = time.time()
+        self.fading = None
+        self.reach = float(self.dist.max()) if len(self.dist) else 1.0
+        self._frame()
+        self.timer.start()
+
+    def _frame(self):
+        import time
+
+        if self.actor is None:
+            return
+        t = time.time() - self.t0
+        front = self.SPEED * t
+        band = np.exp(-((self.dist - front) / 0.9) ** 2)  # the wave front
+        passed = (self.dist < front).astype(float)
+        pulse = 0.32 + 0.12 * np.sin(2 * np.pi * max(t - self.reach / self.SPEED, 0) / 0.9)
+        k = np.maximum(band, passed * pulse)
+        if self.fading is not None:  # search finished: fade out
+            f = max(0.0, 1.0 - (time.time() - self.fading) / 0.6)
+            k = k * f
+            if f <= 0:
+                self.stop()
+                return
+        rgb = (1 - k)[:, None] * self.base[None] + k[:, None] * np.array(self.GLOW)[None]
+        self.colors[:] = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+        self.vtk_colors.Modified()
+        self.viewer.render()
+
+    def finish(self):
+        import time
+
+        if self.actor is not None:
+            self.fading = time.time()
+
+    def stop(self):
+        self.timer.stop()
+        if self.actor is not None:
+            self.viewer.ren.RemoveActor(self.actor)
+            self.actor = None
+            self.viewer.render()
+
+
 class ImplantPanel(QWidget):
     def __init__(self, viewer, status, settings=None, parent=None):
         super().__init__(parent)
@@ -148,6 +233,8 @@ class ImplantPanel(QWidget):
         self.mode = None
         self.picker = _Picker(self)
         self.overlay = Overlay(viewer)
+        self.wave = Wave(viewer)
+        self._job = None
         self.active = False
         self.occlusal = None
         self.occlusal_override = None  # set from the view by the user
@@ -357,6 +444,7 @@ class ImplantPanel(QWidget):
             self.btn_body.setChecked(False)
             self.btn_hole.setChecked(False)
             self.overlay.clear()
+            self.wave.stop()
 
     def _pick_mode(self, mode):
         if mode is not None:
@@ -402,7 +490,11 @@ class ImplantPanel(QWidget):
         d = np.array(cam.GetPosition()) - np.array(cam.GetFocalPoint())
         return d / (np.linalg.norm(d) or 1.0)
 
-    def clicked(self, model, point):
+    def clicked(self, model, point, wait=False):
+        """Search from the clicked point. The search runs in the background while a wave runs over
+        the scan body (``wait``: search right away, e.g. for the self-test)."""
+        if getattr(self, "_job", None) is not None:
+            return  # a search is running
         mode = self.mode
         self.btn_body.setChecked(False)
         self.btn_hole.setChecked(False)
@@ -429,20 +521,68 @@ class ImplantPanel(QWidget):
                 QMessageBox.information(self, "Implant", "No readable implant library. Choose the library folder "
                                         "(e.g. ...\\DentalCADApp\\library\\implant) and check it.")
                 return
-            self.matches = identify(self.site, entries,
-                                    lambda t: (self.status(t), QApplication.processEvents()), index=self.index)
-            try:
-                from .diagnostics import log
-
-                c = self.site.cyl
-                tilt = float(np.degrees(np.arccos(np.clip(abs(c.axis @ self.occlusal), 0, 1))))
-                log(f"implant: click {np.round(point, 2)} cylinder r={c.radius:.2f} fit={c.fit * 1000:.0f}um "
-                    f"tilt={tilt:.1f}deg flipped={c.flipped} points={len(self.site.points)} | " +
-                    "; ".join(f"{m.entry.library}/{m.score:.2f}/{m.rms * 1000:.0f}um" for m in self.matches[:3]))
-            except Exception:  # noqa: BLE001
-                pass
         finally:
             QApplication.restoreOverrideCursor()
+        point = np.asarray(point, float)
+        if wait:
+            self.matches = identify(self.site, entries, lambda t: None, index=self.index)
+            self._search_done(point)
+            return
+        # background search, wave on the scan body meanwhile
+        import threading
+
+        job = {"done": False, "result": None, "msg": "Searching the library..."}
+        self._job = job
+        site, index = self.site, self.index
+
+        def work():
+            try:
+                job["result"] = identify(site, entries, lambda t: job.__setitem__("msg", t), index=index)
+            except Exception as exc:  # noqa: BLE001
+                job["result"] = exc
+            job["done"] = True
+
+        if self.site.body_tris is not None and len(self.site.body_tris):
+            self.wave.start(self.site.body_tris, point, model.color)
+        self.btn_body.setEnabled(False)
+        self.btn_hole.setEnabled(False)
+        self.find_lbl.setText(f"Scan body Ø {2 * self.site.cyl.radius:.2f} mm found. Searching the library...")
+        threading.Thread(target=work, daemon=True).start()
+        self._poll(point)
+
+    def _poll(self, point):
+        from PySide6.QtCore import QTimer
+
+        job = self._job
+        if job is None:
+            return
+        self.status(job["msg"])
+        if not job["done"]:
+            QTimer.singleShot(120, lambda: self._poll(point))
+            return
+        self._job = None
+        self.btn_body.setEnabled(True)
+        self.btn_hole.setEnabled(True)
+        res = job["result"]
+        if isinstance(res, Exception):
+            self.wave.stop()
+            QMessageBox.warning(self, "Implant", f"The search failed: {type(res).__name__}: {res}")
+            return
+        self.matches = res
+        self.wave.finish()
+        self._search_done(point)
+
+    def _search_done(self, point):
+        try:
+            from .diagnostics import log
+
+            c = self.site.cyl
+            tilt = float(np.degrees(np.arccos(np.clip(abs(c.axis @ self.occlusal), 0, 1))))
+            log(f"implant: click {np.round(point, 2)} cylinder r={c.radius:.2f} fit={c.fit * 1000:.0f}um "
+                f"tilt={tilt:.1f}deg flipped={c.flipped} points={len(self.site.points)} | " +
+                "; ".join(f"{m.entry.library}/{m.score:.2f}/{m.rms * 1000:.0f}um" for m in self.matches[:3]))
+        except Exception:  # noqa: BLE001
+            pass
         self._fill_results()
 
     def _fill_results(self):

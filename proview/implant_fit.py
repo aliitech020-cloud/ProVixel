@@ -302,6 +302,60 @@ class ScanSite:
     points: np.ndarray  # surface samples around the click (world)
     normals: np.ndarray
     cyl: Cylinder | None
+    body_tris: np.ndarray | None = None  # triangles of the scan body (world), for display
+
+
+def search_cylinder(cen, fn, areas, click, r_range=(1.0, 3.6), inward=False):
+    """Cylinder through the clicked point found by trying every axis direction (perpendicular to
+    the surface at the click) and every radius: the one most surface lies on, with the surface
+    facing away from (or, for a hole, towards) the axis. Independent of how the triangles are
+    joined, of noise, of the occlusal direction and of the normals' sign.
+    Returns (axis, centre, radius, inlier mask) or None."""
+    d = np.linalg.norm(cen - click, axis=1)
+    local = d < 0.8
+    if local.sum() < 3:
+        local = np.argsort(d)[:8]
+    n0 = (fn[local] * areas[local][:, None]).sum(0)
+    if np.linalg.norm(n0) < 1e-9:
+        return None
+    n0 /= np.linalg.norm(n0)
+    e1, e2 = _perp_basis(n0)
+    near = np.flatnonzero(d < 9.0)
+    if len(near) > 5000:  # enough samples; keeps the search fast on dense scans
+        near = np.random.default_rng(0).choice(near, 5000, replace=False)
+    P, N, A = cen[near], fn[near], areas[near]
+    radii = np.arange(r_range[0], r_range[1] + 1e-9, 0.05)
+    best = None
+    for th in np.radians(np.arange(0, 180, 2.0)):
+        a = np.cos(th) * e1 + np.sin(th) * e2
+        na = N @ a
+        wall = np.abs(na) < 0.3
+        if wall.sum() < 10:
+            continue
+        Pw, Nw, Aw = P[wall], N[wall], A[wall]
+        relc = Pw - click
+        relc -= np.outer(relc @ a, a)  # perpendicular to the axis
+        Nw_perp = Nw - np.outer(Nw @ a, a)
+        Nw_perp /= np.linalg.norm(Nw_perp, axis=1, keepdims=True) + 1e-12
+        for sgn in (1.0, -1.0):  # centre on either side of the click (normals may be flipped)
+            off = sgn * n0  # perpendicular to every tried axis
+            # for every radius: distance of the wall points to the axis line through click - r * off
+            q = relc[None, :, :] + radii[:, None, None] * off[None, None, :]
+            rad = np.linalg.norm(q, axis=2)
+            on = np.abs(rad - radii[:, None]) < 0.08
+            rdir = q / (rad[..., None] + 1e-12)
+            facing = np.abs(np.einsum("rij,ij->ri", rdir, Nw_perp)) > 0.85
+            score = ((on & facing) * Aw[None, :]).sum(1)
+            k = int(np.argmax(score))
+            if best is None or score[k] > best[0]:
+                best = (float(score[k]), a, click - radii[k] * off, float(radii[k]))
+    if best is None or best[0] < 2.0:  # less than ~2 mm2 of wall on the cylinder
+        return None
+    _, a, c, r = best
+    rel = cen - c
+    rad = np.linalg.norm(rel - np.outer(rel @ a, a), axis=1)
+    inl = (np.abs(rad - r) < 0.15) & (np.abs(fn @ a) < 0.35) & (d < 12.0)
+    return a, c, r, inl
 
 
 def _smooth_region(faces, fn, seed, max_angle=20.0):
@@ -346,9 +400,38 @@ def scan_site(world_vertices, faces, click, radius=7.0, hint_up=None, inward=Fal
         fn = cr / (2 * areas[:, None] + 1e-12)
         cen = tri.mean(1)
         cyl = None
+        body_tris = None
+        found = None if inward else search_cylinder(cen, fn, areas, click)
+        if found is not None:
+            a, c, r, inl = found
+            refined = fit_cylinder(cen[inl], fn[inl], areas[inl], candidates=[a], inward=inward) \
+                if inl.sum() >= 20 else None
+            if refined is not None and refined.axis @ a < 0:
+                refined.axis = -refined.axis
+            if refined is not None and abs(refined.radius - r) < 0.3 and refined.axis @ a > 0.97:
+                cyl = refined
+            else:
+                rel = cen[inl] - c
+                agree = np.einsum("ij,ij->i", rel - np.outer(rel @ a, a), fn[inl])
+                cyl = Cylinder(a, c, r, 0.0, 0.0, bool(np.sum(agree) < 0))
+            # which end is free: away from the surrounding tissue, else towards the occlusal side
+            rad_all = cyl.radial(cen)
+            h_all = cen @ cyl.axis
+            ring = rad_all <= cyl.radius + 0.3
+            far = (rad_all > cyl.radius + 1.0) & (np.linalg.norm(cen - click, axis=1) < 8)
+            if ring.any() and far.any():
+                if h_all[ring].mean() < h_all[far].mean():
+                    cyl.axis = -cyl.axis
+            elif hint_up is not None and cyl.axis @ hint_up < 0:
+                cyl.axis = -cyl.axis
+            h_all = cen @ cyl.axis
+            cyl.top = float(h_all[ring].max()) if ring.any() else float(h_all.max())
+            body = (rad_all <= cyl.radius + 0.2) & (h_all >= cyl.top - 12) & \
+                (np.linalg.norm(cen - click, axis=1) < 13)
+            body_tris = tri[body]
         seed = int(np.argmin(np.linalg.norm(cen - click, axis=1)))
-        wall = _smooth_region(f, fn, seed)
-        if wall.sum() >= 30:
+        wall = _smooth_region(f, fn, seed) if cyl is None else np.zeros(len(f), bool)
+        if cyl is None and wall.sum() >= 30:
             cyl = fit_cylinder(cen[wall], fn[wall], areas[wall], hint_up=hint_up, inward=inward, max_tilt=45)
             if cyl is not None:
                 # top (or bottom of a hole) from all the surface around the axis
@@ -366,7 +449,7 @@ def scan_site(world_vertices, faces, click, radius=7.0, hint_up=None, inward=Fal
             continue
         if cyl.flipped:
             fn = -fn  # work with outward normals from here on
-        best = ScanSite(cen, fn, cyl)
+        best = ScanSite(cen, fn, cyl, body_tris if found is not None else None)
         break
     if best is None:
         try:

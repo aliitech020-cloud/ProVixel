@@ -139,7 +139,7 @@ def _selftest_implant(win, app, root):
     win.a_implant.setChecked(True)
     ip = win.implant_panel
     ip.occlusal_override = np.array([0.0, 0.0, 1.0])
-    ip.clicked(m, np.array([-2.0, 0.0, 8.0]))
+    ip.clicked(m, np.array([-2.0, 0.0, 8.0]), wait=True)
     assert ip.matches and ip.matches[0].score > 0.6, "implant: scan body not identified"
     assert "Straight" in ip.result_lbl.text(), "implant: unexpected suggestion"
     win.a_implant.setChecked(False)
