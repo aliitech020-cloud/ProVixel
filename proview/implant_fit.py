@@ -377,11 +377,11 @@ def search_cylinder(cen, fn, areas, click, r_range=(1.0, 3.6), inward=False):
                   np.arange(max(r_range[0], r0 - 0.15), min(r_range[1], r0 + 0.15) + 1e-9, 0.02), P, N, A)
     if best is None or best[0] < 2.0:  # less than ~2 mm2 of wall on the cylinder
         return None
-    _, a, c, r, _th = best
+    score, a, c, r, _th = best
     rel = cen - c
     rad = np.linalg.norm(rel - np.outer(rel @ a, a), axis=1)
     inl = (np.abs(rad - r) < 0.15) & (np.abs(fn @ a) < 0.35) & (d < 12.0)
-    return a, c, r, inl
+    return a, c, r, inl, score
 
 
 def _smooth_region(faces, fn, seed, max_angle=20.0):
@@ -428,8 +428,18 @@ def scan_site(world_vertices, faces, click, radius=7.0, hint_up=None, inward=Fal
         cyl = None
         body_tris = None
         found = None if inward else search_cylinder(cen, fn, areas, click)
+        if not inward:
+            # a click on a flat side gives a poor cylinder: also try points around it where the surface
+            # turns, and keep the cylinder with the most wall on it
+            dc = np.linalg.norm(cen - click, axis=1)
+            n_click = fn[np.argmin(dc)]
+            ring = np.flatnonzero((dc > 1.0) & (dc < 2.2) & (np.abs(fn @ n_click) < 0.94))
+            for idx in ring[np.linspace(0, len(ring) - 1, min(4, len(ring))).astype(int)] if len(ring) else []:
+                alt = search_cylinder(cen, fn, areas, cen[idx])
+                if alt is not None and (found is None or alt[4] > found[4] * 1.15):
+                    found = alt
         if found is not None:
-            a, c, r, inl = found
+            a, c, r, inl, _score = found
             refined = fit_cylinder(cen[inl], fn[inl], areas[inl], candidates=[a], inward=inward) \
                 if inl.sum() >= 20 else None
             if refined is not None and refined.axis @ a < 0:
@@ -592,9 +602,90 @@ def _match_one(shape: MarkerShape, site: ScanSite) -> tuple[np.ndarray, float, f
     return _refine(shape, src, src_n, starts)
 
 
-def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, max_candidates=24,
-             index: dict | None = None) -> list[Match]:
-    """Library scan bodies ranked by how well they fit the scanned one (best first)."""
+def _coarse_score(shape: MarkerShape, site: ScanSite, pts) -> float:
+    """Fast shape check without ICP: 12 turns x 5 axial shifts, one KD query for all of them.
+    Mean distance (capped at 0.3 mm) of the best start; lower is better."""
+    sc, mc = site.cyl, shape.cyl
+    R0 = _rot_to(mc.axis, sc.axis)
+    top_m = mc.centre + mc.axis * (mc.top - mc.centre @ mc.axis)
+    top_s = sc.centre + sc.axis * (sc.top - sc.centre @ sc.axis)
+    Ws = []
+    for k in range(12):
+        R = _about(sc.axis, 2 * np.pi * k / 12) @ R0
+        Rt = R.T
+        for off in (-2.0, -1.0, 0.0, 1.0, 2.0):
+            t = top_s + sc.axis * off - R @ top_m
+            W = np.eye(4)
+            W[:3, :3] = Rt
+            W[:3, 3] = -Rt @ t
+            Ws.append(W)
+    Ws = np.array(Ws)
+    P = np.einsum("sij,nj->sni", Ws[:, :3, :3], pts) + Ws[:, None, :3, 3]
+    d, _ = shape.target.tree.query(P.reshape(-1, 3))
+    return float(np.minimum(d.reshape(len(Ws), -1), 0.3).mean(1).min())
+
+
+# ---------------------------------------------------------------------- learning
+def memory_file() -> str:
+    import os
+
+    from .diagnostics import log_path
+
+    return os.path.join(os.path.dirname(log_path()), "implant_memory.json")
+
+
+def load_memory() -> list:
+    import json
+    import os
+
+    path = memory_file()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def remember(site: ScanSite, match: "Match", entry: LibEntry) -> None:
+    """The user confirmed this scan body: next time a similar one is always compared in detail and
+    systems used more often come first when two fit about equally."""
+    import json
+    import os
+
+    sc = site.cyl
+    near = sc.radial(site.points) <= sc.radius + 1.0
+    prof = profile(site.points[near], site.normals[near], sc)
+    mem = load_memory()
+    for m in mem:
+        if m.get("hash") == match.shape.hash and abs(m.get("radius", 0) - sc.radius) < 0.1:
+            m["count"] = int(m.get("count", 1)) + 1
+            break
+    else:
+        mem.append({"hash": match.shape.hash, "marker": entry.marker, "library": entry.library,
+                    "manufacturer": entry.manufacturer, "radius": float(sc.radius),
+                    "profile": [None if not np.isfinite(x) else float(x) for x in prof], "count": 1})
+    path = memory_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(mem, fh, ensure_ascii=False, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def manufacturer_of(entry: LibEntry) -> str:
+    name = entry.manufacturer or entry.library.replace("-", "_").split("_")[0]
+    return name.strip() or entry.library
+
+
+def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, max_candidates=250,
+             index: dict | None = None, memory: list | None = None, detailed: int = 8) -> list[Match]:
+    """Library scan bodies ranked by how well they fit the scanned one (best first).
+
+    Stage 1: every library scan body of about the same diameter gets a fast shape check (no ICP).
+    Stage 2: the most promising ones, and the ones the user confirmed before for a similar scan
+    body, are registered precisely."""
     if site.cyl is None:
         return []
     sc = site.cyl
@@ -602,6 +693,7 @@ def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, m
     site_prof = profile(site.points[near], site.normals[near], sc)
     if index is None:
         index = library_index(entries, progress=progress)
+    memory = load_memory() if memory is None else memory
     groups: dict = {}
     for e in entries:
         d = index.get(e.marker)
@@ -609,39 +701,50 @@ def identify(site: ScanSite, entries: list[LibEntry], progress=lambda t: None, m
             continue
         g = groups.setdefault(d["hash"], [d, []])
         g[1].append(e)
+    # confirmed before for a similar scan body
+    forced, used = set(), {}
+    for m in memory:
+        used[m.get("manufacturer") or m.get("library", "")] = used.get(m.get("manufacturer") or m.get("library", ""),
+                                                                       0) + int(m.get("count", 1))
+        prof = np.array([np.nan if x is None else x for x in m.get("profile", [])], float)
+        if abs(m.get("radius", 0) - sc.radius) < 0.2 and len(prof) == len(site_prof) and \
+                profile_distance(site_prof, prof) < 0.3:
+            forced.add(m.get("hash"))
     ranked = []
-    for d, es in groups.values():
-        if abs(d["radius"] - sc.radius) > 0.6:
+    for h, (d, es) in groups.items():
+        dr = abs(d["radius"] - sc.radius)
+        if dr > 0.6 and h not in forced:
             continue
         prof = np.array([np.nan if x is None else x for x in d["profile"]], float)
         dist = profile_distance(site_prof, prof)
-        if not np.isfinite(dist):
-            dist = abs(d["radius"] - sc.radius) + 1.0
-        ranked.append((dist, es))
-    ranked.sort(key=lambda r: r[0])
-    out = []
+        ranked.append((0 if h in forced else 1, (dist if np.isfinite(dist) else 1.0) + dr, h, es))
+    ranked.sort(key=lambda r: (r[0], r[1]))
     shortlist = ranked[:max_candidates]
     src, src_n = _zone(site)
     if len(src) < 30:
         return []
-    # stage 1: every candidate, quick (no ICP); stage 2: ICP for the most promising ones
-    quick = []
-    for k, (dist, es) in enumerate(shortlist):
-        progress(f"Comparing {k + 1}/{len(shortlist)}: {es[0].title}")
+    pts = src if len(src) <= 400 else src[np.random.default_rng(3).choice(len(src), 400, replace=False)]
+    coarse = []
+    for k, (f, _dist, h, es) in enumerate(shortlist):
+        if k % 5 == 0:
+            progress(f"Checking the library {k + 1}/{len(shortlist)}")
         shape = marker_shape(es[0])
         if shape is None:
             continue
-        q, starts = _quick_starts(shape, site, src)
-        quick.append((q, shape, es, starts))
-    quick.sort(key=lambda x: x[0])
-    for k, (q, shape, es, starts) in enumerate(quick[:6]):
-        progress(f"Fitting {k + 1}/{min(6, len(quick))}: {es[0].title}")
+        coarse.append((f, _coarse_score(shape, site, pts), shape, es))
+    coarse.sort(key=lambda x: (x[0], x[1]))
+    chosen = [c for c in coarse if c[0] == 0] + [c for c in coarse if c[0] == 1][:detailed]
+    out = []
+    for k, (_f, _q, shape, es) in enumerate(chosen):
+        progress(f"Fitting {k + 1}/{len(chosen)}: {es[0].title}")
+        _, starts = _quick_starts(shape, site, src)
         T, rms, inl, cov = _refine(shape, src, src_n, starts)
         if not np.isfinite(rms):
             continue
         score = inl * (0.75 + 0.25 * cov) * np.exp(-max(rms - 0.03, 0) / 0.08)
         out.append(Match(es, shape, T, rms, inl, cov, float(score)))
-    out.sort(key=lambda m: -m.score)
+    # systems used more often first when two fit about equally
+    out.sort(key=lambda m: -(m.score + 0.01 * np.log1p(used.get(m.entry.manufacturer or m.entry.library, 0))))
     return out
 
 

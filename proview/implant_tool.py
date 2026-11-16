@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
 )
 
 from .implant_fit import (
+    manufacturer_of,
+    remember,
     Rules,
     confidence,
     identify,
@@ -296,6 +298,11 @@ class ImplantPanel(QWidget):
         self.type_combo.currentIndexChanged.connect(lambda _i: self._update_result())
         form.addRow("Implant", self.type_combo)
         fl.addLayout(form)
+        self.btn_ok = QPushButton("This is correct  (remember it)")
+        self.btn_ok.setToolTip("Confirms the selected system: similar scan bodies are then always compared in "
+                               "detail, and the systems you use come first")
+        self.btn_ok.clicked.connect(lambda _=False: self.confirm())
+        fl.addWidget(self.btn_ok)
         row = QHBoxLayout()
         b = QPushButton("Occlusal axis from view")
         b.setToolTip("Look straight onto the occlusal plane (teeth towards you) and press: the angulation is "
@@ -540,11 +547,11 @@ class ImplantPanel(QWidget):
         point = np.asarray(point, float)
         self._last = (model, point)
         words = [w for w in self.filter.text().lower().replace(",", " ").split() if w]
-        limit = 24
+        limit = 250
         if words:
             entries = [e for e in entries if any(w in f"{e.library} {e.manufacturer} {e.part_name} {e.name}".lower()
                                                  for w in words)]
-            limit = 80
+            limit = 400
             if not entries:
                 QMessageBox.information(self, "Implant", "No scan body in the library matches the search text.")
                 return
@@ -620,7 +627,15 @@ class ImplantPanel(QWidget):
                                   "Check the library folder.")
         else:
             head = {"sure": "Identified", "likely": "Probably", "unsure": "Not sure — closest systems"}[conf]
-            self.find_lbl.setText(f"{head}. Scan body Ø {2 * self.site.cyl.radius:.2f} mm.")
+            best_by_maker = {}
+            for m in self.matches:
+                for e in m.entries:
+                    mk = manufacturer_of(e)
+                    best_by_maker[mk] = max(best_by_maker.get(mk, 0.0), m.score)
+            makers = sorted(best_by_maker.items(), key=lambda kv: -kv[1])[:3]
+            summary = "  ·  ".join(f"{mk} {sc * 100:.0f}%" for mk, sc in makers)
+            self.find_lbl.setText(f"{head}. Scan body Ø {2 * self.site.cyl.radius:.2f} mm.\nMost likely company: "
+                                  f"{summary}")
         for m in self.matches[:6]:
             extra = f"  (+{len(m.entries) - 1} with the same scan body)" if len(m.entries) > 1 else ""
             it = QListWidgetItem(f"{m.score * 100:3.0f}%   {m.entry.title}{extra}\n"
@@ -700,6 +715,21 @@ class ImplantPanel(QWidget):
         self.overlay.show(None, platform, cyl.axis, meas.occlusal, radius=cyl.radius)
         self._show_text(meas, sg, None)
 
+    def confirm(self):
+        row = self.results.currentRow()
+        if self.site is None or not (0 <= row < len(self.matches)):
+            QMessageBox.information(self, "Implant", "Select the correct system in the list first.")
+            return
+        m = self.matches[row]
+        e = m.entries[max(self.entry_combo.currentIndex(), 0)]
+        try:
+            remember(self.site, m, e)
+        except OSError as exc:
+            QMessageBox.warning(self, "Implant", f"Could not save: {exc}")
+            return
+        self.status(f"Remembered: {e.title}")
+        self.find_lbl.setText(f"Confirmed: {e.title}")
+
     def save_diagnostics(self):
         import datetime
 
@@ -710,8 +740,10 @@ class ImplantPanel(QWidget):
             QMessageBox.information(self, "Implant", "Click a scan body first.")
             return
         model, point = last
-        folder = os.path.join(os.path.expanduser("~"), "Documents", "ProVixel diagnostics",
-                              datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        from PySide6.QtCore import QStandardPaths
+
+        docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or os.path.expanduser("~")
+        folder = os.path.join(docs, "ProVixel diagnostics", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         os.makedirs(folder, exist_ok=True)
         wv = model.world_geometry()[0]
         f = model.mesh.faces
@@ -733,6 +765,7 @@ class ImplantPanel(QWidget):
 
         open_folder(folder)
         self.status(f"Diagnostic data saved in {folder}")
+        QMessageBox.information(self, "Implant", f"Saved in:\n{folder}")
 
     def _opposing(self):
         out = []
