@@ -191,6 +191,37 @@ class MarkerShape:
 _SHAPES: dict = {}
 
 
+def _marker_cylinder(mesh, axis_hint):
+    """(cylinder of the scan body's upper part, centroids, normals, areas) of a library scan body.
+
+    The axis comes from the shape itself (the library's AxisOcclusal is not always given); the top
+    is the end farther from the library origin, where the implant sits."""
+    fn = mesh.face_normals()
+    tri = mesh.vertices[mesh.faces]
+    areas = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) / 2
+    cen = tri.mean(1)
+    hint = np.asarray(axis_hint, float)
+    hint /= np.linalg.norm(hint) or 1.0
+    whole = fit_cylinder(cen, fn, areas, candidates=[hint])
+    a = whole.axis if whole is not None else hint
+    hv = mesh.vertices @ a
+    lo, hi = float(hv.min()), float(hv.max())
+    if abs(abs(hi) - abs(lo)) > 0.5:
+        if abs(lo) > abs(hi):
+            a = -a
+    elif a @ hint < 0:
+        a = -a
+    h = cen @ a
+    upper = h > h.max() - 6.0
+    cyl = fit_cylinder(cen[upper], fn[upper], areas[upper], candidates=[a])
+    if cyl is None:
+        return None, cen, fn, areas
+    if cyl.axis @ a < 0:
+        cyl.axis = -cyl.axis
+    cyl.top = float((mesh.vertices @ cyl.axis).max())
+    return cyl, cen, fn, areas
+
+
 def marker_shape(entry: LibEntry) -> MarkerShape | None:
     key = entry.marker
     if key in _SHAPES:
@@ -198,28 +229,15 @@ def marker_shape(entry: LibEntry) -> MarkerShape | None:
     mesh = load_geometry(entry.marker)
     shape = None
     if mesh is not None:
-        fn = mesh.face_normals()
-        tri = mesh.vertices[mesh.faces]
-        areas = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) / 2
-        cen = tri.mean(1)
-        pts = np.vstack([mesh.vertices, cen])
-        nrm = np.vstack([mesh.vertex_normals(), fn])
-        axis = np.asarray(entry.axis, float)
-        axis /= np.linalg.norm(axis) or 1.0
-        # the scan body's own cylinder near its top (the part a scanner sees)
-        h = cen @ axis
-        upper = h > h.max() - 6.0
-        cyl = fit_cylinder(cen[upper], fn[upper], areas[upper], hint_up=axis, candidates=[axis])
-        if cyl is not None and cyl.flipped:
-            nrm = -nrm
+        cyl, cen, fn, areas = _marker_cylinder(mesh, entry.axis)
         if cyl is not None:
-            if cyl.axis @ axis < 0:
-                cyl.axis = -cyl.axis
-            cyl.top = float((pts @ cyl.axis).max())
+            pts = np.vstack([mesh.vertices, cen])
+            nrm = np.vstack([mesh.vertex_normals(), fn])
+            if cyl.flipped:
+                nrm, fn = -nrm, -fn
             hp = pts @ cyl.axis
             shape = MarkerShape(entry.marker, file_hash(entry.marker), pts, nrm, cyl,
-                                FixedTarget(pts, nrm), pts[hp > cyl.top - 2.0],
-                                profile(cen, fn if not cyl.flipped else -fn, cyl))
+                                FixedTarget(pts, nrm), pts[hp > cyl.top - 2.0], profile(cen, fn, cyl))
     _SHAPES[key] = shape
     return shape
 
@@ -229,20 +247,9 @@ def describe_marker(path: str, axis) -> dict | None:
     mesh = load_geometry(path)
     if mesh is None:
         return None
-    fn = mesh.face_normals()
-    tri = mesh.vertices[mesh.faces]
-    areas = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) / 2
-    cen = tri.mean(1)
-    a = np.asarray(axis, float)
-    a /= np.linalg.norm(a) or 1.0
-    h = cen @ a
-    upper = h > h.max() - 6.0
-    cyl = fit_cylinder(cen[upper], fn[upper], areas[upper], hint_up=a, candidates=[a])
+    cyl, cen, fn, areas = _marker_cylinder(mesh, axis)
     if cyl is None:
         return None
-    if cyl.axis @ a < 0:
-        cyl.axis = -cyl.axis
-    cyl.top = float((mesh.vertices @ cyl.axis).max())
     prof = profile(cen, -fn if cyl.flipped else fn, cyl)
     return {"hash": file_hash(path), "radius": cyl.radius, "profile": [None if not np.isfinite(x) else float(x)
                                                                         for x in prof]}
@@ -267,7 +274,7 @@ def library_index(entries: list[LibEntry], cache_file: str | None = None, progre
             st = os.stat(e.marker)
         except OSError:
             continue
-        key = f"{e.marker}|{st.st_size}|{int(st.st_mtime)}|v1"
+        key = f"{e.marker}|{st.st_size}|{int(st.st_mtime)}|v2"
         if key not in cache:
             if k % 10 == 0:
                 progress(f"Indexing the scan bodies {k + 1}/{len(todo)} (only the first time)")

@@ -256,6 +256,15 @@ class ImplantPanel(QWidget):
         b.clicked.connect(lambda _=False: self.check_library())
         row.addWidget(b)
         bl.addLayout(row)
+        frow = QHBoxLayout()
+        frow.addWidget(QLabel("Search only"))
+        self.filter = QLineEdit(self._get("filter", ""))
+        self.filter.setPlaceholderText("all libraries  (e.g. straumann, medentika)")
+        self.filter.setToolTip("Compare only scan bodies whose library, manufacturer or name contains this text")
+        self.filter.editingFinished.connect(lambda: self.settings is not None and
+                                            self.settings.setValue("implant/filter", self.filter.text()))
+        frow.addWidget(self.filter, 1)
+        bl.addLayout(frow)
         lay.addWidget(box)
 
         # ---- find
@@ -330,6 +339,11 @@ class ImplantPanel(QWidget):
             w.valueChanged.connect(lambda _v: self._rules_changed())
         self.r_angles.editingFinished.connect(lambda: self._rules_changed())
         lay.addWidget(box)
+        b = QPushButton("Save diagnostic data")
+        b.setToolTip("Saves the surface around the last click (STL, no patient data) and the search report in a "
+                     "folder, to send for checking when a scan body is not recognised")
+        b.clicked.connect(lambda _=False: self.save_diagnostics())
+        lay.addWidget(b)
         note = QLabel("A suggestion to help: the final choice is the technician's / dentist's.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#7d838c; font-size:11px;")
@@ -524,8 +538,19 @@ class ImplantPanel(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
         point = np.asarray(point, float)
+        self._last = (model, point)
+        words = [w for w in self.filter.text().lower().replace(",", " ").split() if w]
+        limit = 24
+        if words:
+            entries = [e for e in entries if any(w in f"{e.library} {e.manufacturer} {e.part_name} {e.name}".lower()
+                                                 for w in words)]
+            limit = 80
+            if not entries:
+                QMessageBox.information(self, "Implant", "No scan body in the library matches the search text.")
+                return
+        self._limit = limit
         if wait:
-            self.matches = identify(self.site, entries, lambda t: None, index=self.index)
+            self.matches = identify(self.site, entries, lambda t: None, index=self.index, max_candidates=limit)
             self._search_done(point)
             return
         # background search, wave on the scan body meanwhile
@@ -537,7 +562,8 @@ class ImplantPanel(QWidget):
 
         def work():
             try:
-                job["result"] = identify(site, entries, lambda t: job.__setitem__("msg", t), index=index)
+                job["result"] = identify(site, entries, lambda t: job.__setitem__("msg", t), index=index,
+                                         max_candidates=limit)
             except Exception as exc:  # noqa: BLE001
                 job["result"] = exc
             job["done"] = True
@@ -673,6 +699,40 @@ class ImplantPanel(QWidget):
                               "bottom of the hole).")
         self.overlay.show(None, platform, cyl.axis, meas.occlusal, radius=cyl.radius)
         self._show_text(meas, sg, None)
+
+    def save_diagnostics(self):
+        import datetime
+
+        from .mesh import Mesh, save_stl
+
+        last = getattr(self, "_last", None)
+        if last is None:
+            QMessageBox.information(self, "Implant", "Click a scan body first.")
+            return
+        model, point = last
+        folder = os.path.join(os.path.expanduser("~"), "Documents", "ProVixel diagnostics",
+                              datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        os.makedirs(folder, exist_ok=True)
+        wv = model.world_geometry()[0]
+        f = model.mesh.faces
+        near = (np.linalg.norm(wv - point, axis=1) < 12.0)[f].all(1)
+        crop = Mesh(wv, f).keep_faces(near)
+        save_stl(os.path.join(folder, "scan_around_click.stl"), crop)
+        lines = [f"click: {np.round(point, 4).tolist()}"]
+        if self.site is not None and self.site.cyl is not None:
+            c = self.site.cyl
+            lines.append(f"cylinder: r={c.radius:.3f} axis={np.round(c.axis, 4).tolist()} "
+                         f"centre={np.round(c.centre, 3).tolist()} top={c.top:.3f} flipped={c.flipped}")
+        lines.append(f"search text: {self.filter.text()!r}")
+        for m in self.matches[:10]:
+            lines.append(f"{m.score:.3f}  rms={m.rms * 1000:.0f}um  surface={m.inliers:.2f}  top={m.coverage:.2f}  "
+                         f"{m.entry.library} | {m.entry.part_name} | {os.path.basename(m.entry.marker)}")
+        with open(os.path.join(folder, "report.txt"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        from .case_ui import open_folder
+
+        open_folder(folder)
+        self.status(f"Diagnostic data saved in {folder}")
 
     def _opposing(self):
         out = []
